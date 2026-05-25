@@ -73,7 +73,7 @@ import groovy.transform.CompileStatic
 @Field static Map       configureInflight       = [:]    // ruleId -> [startedMs, name], for dropped-response watchdog
 
 definition(
-    name:           "Rules Special Actions Scanner 1.03",
+    name:           "Rules Special Actions Scanner 1.05",
     namespace:      "John Land",
     author:         "John Land & AI",
     description:    "Scans RM/BC rules and reports selected special-action keywords found in rule configuration JSON.",
@@ -101,7 +101,8 @@ mappings {
 // ============================================================
 
 void installed() {
-    if (debugEnable) log.debug "SAS: installed — ${app.name}"
+    syncAppInstanceLabel()
+    if (debugEnable) log.debug "SAS: installed — ${getAppDisplayName()}"
     checkOAuth()
     initialize()
 }
@@ -109,11 +110,11 @@ void installed() {
 void updated() {
     if (debugEnable) log.debug "SAS: updated — label: '${app.label}', scan active: ${currentScanId != null || configureScanId != null}"
 
-    String newLabel = settings.vAppLabel?.trim()
-    if (newLabel && newLabel != app.label) {
-        app.updateLabel(newLabel)
-        log.info "SAS: app label updated to '${newLabel}'"
-    }
+    // Keep the Hubitat app instance label and this page title in sync with the
+    // custom App instance name field.  This avoids the double-title effect where
+    // Hubitat's outer header shows the renamed instance but the dynamicPage title
+    // still shows the static app-code name.
+    syncAppInstanceLabel()
 
     boolean scanWasActive = (currentScanId != null || configureScanId != null)
     initialize()
@@ -123,6 +124,43 @@ void updated() {
         reRenderReportIfCached()
     }
 }
+
+private String getAppDisplayName() {
+    String requested = settings?.vAppLabel?.toString()?.trim()
+    if (requested) return requested
+
+    String currentLabel = app?.label?.toString()?.trim()
+    if (currentLabel) return currentLabel
+
+    return app?.name?.toString() ?: "Rules Special Actions Scanner"
+}
+
+private void syncAppInstanceLabel() {
+    String requested = settings?.vAppLabel?.toString()?.trim()
+    if (!requested) return
+
+    String currentLabel = app?.label?.toString()?.trim()
+    if (requested == currentLabel) return
+
+    try {
+        app.updateLabel(requested)
+        if (debugEnable) log.debug "SAS: app label updated to '${requested}'"
+    } catch (Exception e) {
+        log.warn "SAS: app label update failed — ${e.message}"
+    }
+}
+
+private void resetAppInstanceLabel() {
+    String defaultName = app?.name?.toString() ?: "Rules Special Actions Scanner"
+    try {
+        app.updateLabel(defaultName)
+        app.updateSetting("vAppLabel", [value: defaultName, type: "text"])
+        log.info "Rules Special Actions Scanner: app label reset to app name '${defaultName}'"
+    } catch (Exception e) {
+        log.warn "Rules Special Actions Scanner: app label reset failed — ${e.message}"
+    }
+}
+
 
 void initialize() {
     if (currentScanId != null) {
@@ -264,10 +302,11 @@ def renderJson(Map m) {
 
 def mainPage() {
     checkOAuth()
+    syncAppInstanceLabel()
 
     int pollInterval = (currentScanId || configureScanId) ? 5 : 0
 
-    dynamicPage(name: "mainPage", title: "<b>${app.name}</b>", install: true, uninstall: true, refreshInterval: pollInterval) {
+    dynamicPage(name: "mainPage", title: "<b>${htmlEncode(getAppDisplayName())}</b>", install: true, uninstall: true, refreshInterval: pollInterval) {
 
         section("NOTE: Scanning may take a while, be patient!") {
             input name: "btnScan", type: "button", title: "Scan All RM/BC Rules for Special Actions", width: 12
@@ -307,7 +346,8 @@ def mainPage() {
         }
 
         section("Controls", hideable: true, hidden: true) {
-            input "vAppLabel", "text", title: "<b>App instance name</b>", defaultValue: app.label
+            input "vAppLabel", "text", title: "<b>App instance name</b>", defaultValue: getAppDisplayName(), submitOnChange: true, width: 9
+            input "btnResetAppLabel", "button", title: "Reset to App Name", width: 3
 
             if (state.accessToken) {
                 String base = "/apps/api/${app.id}/report?access_token=${state.accessToken}"
@@ -361,7 +401,7 @@ def mainPage() {
                 The hide-column buttons persist without clicking <b>Done</b>.
                 <br><br>
                 <b>Controls section</b><br>
-                App instance rename, printable HTML report, CSV export, and debug logging toggle.
+                App instance rename, Reset to App Name, printable HTML report, CSV export, and debug logging toggle.
                 There are no Private Boolean setters, bulk-apply controls, or scheduled apply controls.
                 <br><br>
                 <b>WARNING</b><br>
@@ -399,6 +439,9 @@ def appButtonHandler(String btn) {
     switch (btn) {
         case "btnScan":
             scanRules()
+            break
+        case "btnResetAppLabel":
+            resetAppInstanceLabel()
             break
         default:
             log.warn "Unknown button: ${btn}"
