@@ -16,6 +16,26 @@
  *      getWaitRule
  *      getWaitEvents
  *
+ *  1.06: Adds a Modes column. During Phase 2 the rule's configuration JSON is
+ *  parsed and walked recursively; any setting whose "type" is "mode" contributes
+ *  its selected mode name(s) to the rule's Modes list. This catches mode
+ *  triggers, mode conditions/required expressions, and Set Mode actions that
+ *  are configured through Hubitat mode inputs. Rules that reference modes only
+ *  indirectly (e.g., via hub variables or custom commands) are not detected.
+ *
+ *  1.07: Fixes mode detection for Rule Machine 5.x / Button Controller. RM does
+ *  not use "mode"-type inputs; it stores mode selections as plain enum settings
+ *  holding mode IDs, using naming conventions:
+ *      modesX<n>   mode trigger selections    (e.g. modesX1 = ["4"])
+ *      modes<n>    mode condition selections  (e.g. modes2  = ["1"])
+ *      mode.<n>    Set Mode action target     (e.g. mode.3  = 4)
+ *      modesY<n>   legacy mode restrictions
+ *  The scanner now also matches settings by these name patterns and translates
+ *  the ID values to mode names via location.getModes(). Values that do not map
+ *  to a known mode ID or mode name on this hub are ignored, which filters out
+ *  unrelated settings that happen to match the name pattern. "mode"-type inputs
+ *  are still detected as before.
+ *
  *  Notes:
  *  - Uses Hubitat local/internal JSON endpoints:
  *      /hub2/appsList
@@ -71,9 +91,15 @@ import groovy.transform.CompileStatic
 @Field static Integer   configureInFlight       = 0      // number of configure/json requests currently in flight
 @Field static Integer   configureTotalRules     = 0      // total number of rules expected in Phase 2
 @Field static Map       configureInflight       = [:]    // ruleId -> [startedMs, name], for dropped-response watchdog
+@Field static Map       modeIdToName            = null   // hub mode ID -> mode name, built at Phase 2 start
+
+// RM/BC mode-selection setting names: modesX<n> (triggers), modes<n> (conditions),
+// mode.<n> (Set Mode action target), modesY<n> (legacy restrictions), plus bare
+// "mode"/"modes" used by mode-type inputs in other contexts.
+@Field static final java.util.regex.Pattern MODE_SETTING_NAME_PATTERN = ~/^modes?[XY]?\d*(\.\d+)?$/
 
 definition(
-    name:           "Rules Special Actions Scanner 1.05",
+    name:           "Rules Special Actions Scanner 1.07",
     namespace:      "John Land",
     author:         "John Land & AI",
     description:    "Scans RM/BC rules and reports selected special-action keywords found in rule configuration JSON.",
@@ -185,6 +211,7 @@ void initialize() {
     configureInFlight       = 0
     configureTotalRules     = 0
     configureInflight       = [:]
+    modeIdToName            = null
 
     unsubscribe()
 
@@ -389,9 +416,22 @@ def mainPage() {
                 requests so very large rules or dropped responses should mark only the affected
                 rule as unknown instead of stopping the whole scan.
                 <br><br>
+                <b>Modes column</b><br>
+                During Phase 2 the configuration JSON is also parsed and searched for mode
+                settings: native <code>mode</code>-type inputs, and Rule Machine's enum settings
+                named <code>modesX&lt;n&gt;</code> (mode triggers), <code>modes&lt;n&gt;</code>
+                (mode conditions/required expressions), <code>mode.&lt;n&gt;</code> (Set Mode
+                actions), and <code>modesY&lt;n&gt;</code> (legacy restrictions). Mode IDs in
+                those settings are translated to mode names using this hub's mode list; values
+                that do not correspond to a mode on this hub are ignored. The resulting mode
+                names are listed in the <b>Modes</b> column. A dash means no mode settings were
+                found; a red question mark means the rule's configuration JSON could not be read.
+                Rules that reference modes only indirectly (for example via hub variables or
+                custom commands) are not detected.
+                <br><br>
                 <b>Table</b><br>
                 Shows Rule ID, Rule name (linked to its config page), App Type, one column for
-                each keyword, and Last Run. Keyword cells show a green checkmark when the keyword
+                each keyword, Modes, and Last Run. Keyword cells show a green checkmark when the keyword
                 is found, a dash when it is not found, or a red question mark when the rule's
                 configuration JSON could not be read.
                 <br><br>
@@ -423,6 +463,7 @@ String buildSummaryHtml() {
     SPECIAL_ACTION_KEYS.each { String key ->
         sb << "; <b>${htmlEncode(labelForKeyword(key))}:</b> ${counts[key] ?: 0}"
     }
+    sb << "; <b>Rules using Modes:</b> ${state.modeRuleCount ?: 0}"
     sb << "<br><br></div>"
     return sb.toString()
 }
@@ -458,6 +499,7 @@ void scanRules() {
     state.specialActionRuleCount    = null
     state.specialActionUnknownCount = null
     state.specialActionCountsJson   = null
+    state.modeRuleCount             = null
 
     state.scanStartedMs             = null
     state.phase1EndedMs             = null
@@ -481,6 +523,7 @@ void scanRules() {
         state.specialActionRuleCount    = 0
         state.specialActionUnknownCount = 0
         state.specialActionCountsJson   = groovy.json.JsonOutput.toJson(emptyKeywordCounts())
+        state.modeRuleCount             = 0
         state.scanStartedMs             = null
         state.phase1EndedMs             = null
         state.lastScan                  = new Date().format("yyyy-MM-dd HH:mm:ss", location.timeZone)
@@ -561,7 +604,8 @@ void handleStatusResponse(resp, data) {
             appType        : data.appType,
             lastRun        : extractLastRun(status),
             specialActions : emptyKeywordCounts(),
-            specialUnknown : true
+            specialUnknown : true,
+            modes          : []
         ]
 
     } catch (Exception e) {
@@ -573,7 +617,8 @@ void handleStatusResponse(resp, data) {
             appType        : (data.appType ?: "RM") as String,
             lastRun        : "",
             specialActions : emptyKeywordCounts(),
-            specialUnknown : true
+            specialUnknown : true,
+            modes          : []
         ]
     } finally {
         if (currentScanId != scanId) return
@@ -721,20 +766,24 @@ void handleConfigureResponse(resp, data) {
         return
     }
 
-    Map foundMap = null
+    Map resultMap = null
 
     try {
         int httpStatus = resp.getStatus() as int
         if (httpStatus == 200) {
             Object raw = resp.getData()
-            foundMap = detectSpecialActionsFromRaw(raw)
-            if (debugEnable) log.debug "configure/json ${ruleId}: specialActions=${foundMap}"
+            Map          foundMap  = detectSpecialActionsFromRaw(raw)
+            List<String> modesList = detectModesFromRaw(raw)
+            if (foundMap != null) {
+                resultMap = [keywords: foundMap, modes: (modesList ?: [])]
+            }
+            if (debugEnable) log.debug "configure/json ${ruleId}: specialActions=${foundMap}, modes=${modesList}"
         } else {
             log.warn "configure/json HTTP ${httpStatus} for rule ${ruleId} (${ruleName})"
         }
     } catch (Exception e) {
         log.warn "handleConfigureResponse ${ruleId} (${ruleName}): ${e.message}"
-        foundMap = null
+        resultMap = null
     }
 
     if (configureScanId != cfgScanId) return
@@ -742,7 +791,7 @@ void handleConfigureResponse(resp, data) {
     if (configureResults == null)  configureResults  = [:]
     if (configureInflight == null) configureInflight = [:]
 
-    configureResults[ruleId] = foundMap
+    configureResults[ruleId] = resultMap
     configureInflight.remove(ruleId)
     configureInFlight = Math.max(0, (configureInFlight ?: 0) - 1)
 
@@ -773,6 +822,150 @@ private Map detectSpecialActionsFromRaw(Object raw) {
     }
 }
 
+// Build the hub's mode ID -> name map from location.getModes(). Called at
+// Phase 2 start (and lazily from detectModesFromRaw as a fallback).
+private void buildModeIdMap() {
+    Map idMap = [:]
+    try {
+        location?.getModes()?.each { Object m ->
+            String mid   = m?.id?.toString()
+            String mname = m?.name?.toString()
+            if (mid && mname) idMap[mid] = mname
+        }
+    } catch (Exception e) {
+        log.warn "buildModeIdMap: could not read location modes — ${e.message}"
+    }
+    modeIdToName = idMap
+    if (debugEnable) log.debug "SAS: location modes: ${idMap}"
+}
+
+// Parse the configure/json payload and collect the mode names a rule uses.
+// Detects both "mode"-type inputs (value is the mode name) and RM/BC enum
+// settings matching MODE_SETTING_NAME_PATTERN (value is a mode ID, translated
+// to a name via location.getModes()). Returns a sorted list of mode names,
+// an empty list when no mode settings are found, or null when the payload
+// could not be parsed (Modes will then show as unknown for that rule).
+private List<String> detectModesFromRaw(Object raw) {
+    try {
+        if (raw == null) return null
+        if (modeIdToName == null) buildModeIdMap()
+
+        Object parsed
+        if (raw instanceof CharSequence) {
+            parsed = new groovy.json.JsonSlurper().parseText(raw.toString())
+        } else {
+            parsed = raw
+        }
+
+        Set<String> modes = [] as Set
+        collectModeSettings(parsed, modes, 0)
+        return modes.sort { it.toLowerCase() }
+    } catch (Exception e) {
+        log.warn "detectModesFromRaw: ${e.message}"
+        return null
+    }
+}
+
+// Recursive walk over the parsed configure/json structure. Harvests mode
+// values from three shapes:
+//   1. A Map node with "type" == "mode" — a native mode input; its "value"
+//      holds mode name(s) directly (non-strict translation).
+//   2. A Map node whose "name" entry matches MODE_SETTING_NAME_PATTERN —
+//      RM-style settings entry like [name: "modesX1", type: "enum",
+//      value: ["4"]]; values are mode IDs (strict translation).
+//   3. A Map entry whose *key* matches the pattern — in case the payload
+//      nests settings as {"modesX1": ...} rather than name/value objects
+//      (strict translation).
+// Uses explicit get()/values() calls because Groovy property access on a Map
+// (node.value) reads map entries, which is what we want for get(), but
+// node.values must be the Map method, not an entry lookup.
+private void collectModeSettings(Object node, Set<String> modes, int depth) {
+    if (depth > 50) return
+
+    if (node instanceof Map) {
+        Map m = (Map) node
+
+        if (m.get("type")?.toString() == "mode") {
+            harvestModeValues(m.get("value"), modes, false)
+        }
+
+        String settingName = m.get("name")?.toString() ?: ""
+        if (settingName && MODE_SETTING_NAME_PATTERN.matcher(settingName).matches()) {
+            harvestModeValues(m.get("value"), modes, true)
+        }
+
+        m.each { Object k, Object v ->
+            String key = k?.toString() ?: ""
+            if (key && key != "name" && key != "type" &&
+                MODE_SETTING_NAME_PATTERN.matcher(key).matches()) {
+                harvestModeValues(v, modes, true)
+            }
+        }
+
+        m.values().each { Object child -> collectModeSettings(child, modes, depth + 1) }
+    } else if (node instanceof List) {
+        ((List) node).each { Object child -> collectModeSettings(child, modes, depth + 1) }
+    }
+}
+
+// Add mode name(s) derived from a raw setting value to the modes set.
+// Handles scalars, Lists, Maps (digs into their "value" entry), and Strings
+// that encode a JSON array (e.g. '["4","1"]'). When translateStrictly is true
+// (name-pattern matches), a value only counts if it maps to a known mode ID
+// or matches a known mode name on this hub — this filters out unrelated
+// settings that happen to match the name pattern. When false (mode-type
+// inputs), untranslatable values are kept as-is since the value is expected
+// to already be the mode name.
+private void harvestModeValues(Object v, Set<String> modes, boolean translateStrictly) {
+    if (v == null) return
+
+    if (v instanceof List) {
+        ((List) v).each { Object it -> harvestModeValues(it, modes, translateStrictly) }
+        return
+    }
+
+    if (v instanceof Map) {
+        harvestModeValues(((Map) v).get("value"), modes, translateStrictly)
+        return
+    }
+
+    String s = v.toString().trim()
+    if (!s) return
+
+    if (s.startsWith("[") && s.endsWith("]")) {
+        try {
+            Object parsed = new groovy.json.JsonSlurper().parseText(s)
+            if (parsed instanceof List) {
+                ((List) parsed).each { Object it -> harvestModeValues(it, modes, translateStrictly) }
+                return
+            }
+        } catch (Exception ignored) {}
+    }
+
+    Map idMap = modeIdToName ?: [:]
+
+    String byId = idMap[s]?.toString()
+    if (byId) {
+        modes << byId
+        return
+    }
+
+    Object byName = idMap.values().find { Object n -> n?.toString()?.equalsIgnoreCase(s) }
+    if (byName != null) {
+        modes << byName.toString()
+        return
+    }
+
+    if (!translateStrictly) modes << s
+}
+
+// Coerce a row's stored modes value (which round-trips through state JSON)
+// back into a clean List<String>.
+private List<String> normalizeModesList(Object raw) {
+    if (!(raw instanceof List)) return []
+    return ((List) raw).collect { it?.toString() }.findAll { it }
+}
+
 void finalizeUsageScan() {
     unschedule("finalizeUsageScan")
     unschedule("configurePump")
@@ -787,13 +980,16 @@ void finalizeUsageScan() {
         Map cfgRes = configureResults ?: [:]
         rows = rows.collect { Map r ->
             String id = r.id?.toString()
-            if (cfgRes.containsKey(id) && cfgRes[id] instanceof Map) {
-                Map found = normalizeKeywordMap(cfgRes[id] as Map)
-                r.specialActions = found
+            Object res = cfgRes.containsKey(id) ? cfgRes[id] : null
+            Map resMap = (res instanceof Map) ? (Map) res : null
+            if (resMap != null && resMap.get("keywords") instanceof Map) {
+                r.specialActions = normalizeKeywordMap(resMap.get("keywords") as Map)
                 r.specialUnknown = false
+                r.modes          = normalizeModesList(resMap.get("modes"))
             } else {
                 r.specialActions = emptyKeywordCounts()
                 r.specialUnknown = true
+                r.modes          = []
             }
             return r
         }
@@ -845,7 +1041,8 @@ void finalizeScan() {
                 appType: (rule.appType ?: "RM") as String,
                 lastRun: "",
                 specialActions: emptyKeywordCounts(),
-                specialUnknown: true]
+                specialUnknown: true,
+                modes: []]
     }
 
     Long phase1EndMs         = now() as Long
@@ -868,6 +1065,7 @@ void finalizeScan() {
     state.scanStatus = "<i>Phase 2: checking configure/json for special-action keywords…</i>"
 
     if (!asyncRules.isEmpty()) {
+        buildModeIdMap()
         configureScanId     = (currentScanId ?: "scan") + "_cfg"
         configureQueue      = asyncRules
         configureResults    = [:]
@@ -995,7 +1193,7 @@ def handleSetPrefEndpoint() {
     String value = params?.value?.toString()
     if (!key) return renderJson([status: "error", message: "missing key"])
 
-    Set allowedKeys = (["hideColRuleId", "hideColAppType", "hideColLastRun"] + SPECIAL_ACTION_KEYS.collect { "hideCol_${it}" }) as Set
+    Set allowedKeys = (["hideColRuleId", "hideColAppType", "hideColModes", "hideColLastRun"] + SPECIAL_ACTION_KEYS.collect { "hideCol_${it}" }) as Set
 
     if (!(key in allowedKeys)) {
         return renderJson([status: "error", message: "unsupported preference key"])
@@ -1060,7 +1258,7 @@ String buildRmPrintHtml() {
 
     StringBuilder sb = new StringBuilder()
     sb << "<table><thead><tr>"
-    (["Rule ID", "Rule", "App Type"] + SPECIAL_ACTION_KEYS.collect { String key -> labelForKeyword(key) } + ["Last Run"]).each { String h ->
+    (["Rule ID", "Rule", "App Type"] + SPECIAL_ACTION_KEYS.collect { String key -> labelForKeyword(key) } + ["Modes", "Last Run"]).each { String h ->
         sb << "<th>${htmlEncode(h)}</th>"
     }
     sb << "</tr></thead><tbody>"
@@ -1075,6 +1273,9 @@ String buildRmPrintHtml() {
             String v = unknown ? "?" : (actions[key] == true ? "Yes" : "No")
             sb << "<td class='c'>${v}</td>"
         }
+        List<String> modesList = normalizeModesList(r.modes)
+        String modesVal = unknown ? "?" : htmlEncode(modesList.join(", "))
+        sb << "<td class='c'>${modesVal}</td>"
         sb << "<td class='c'>${htmlEncode(r.lastRun ?: '')}</td>"
         sb << "</tr>"
     }
@@ -1090,7 +1291,7 @@ String buildRmCsv() {
     rows = rows.sort { it.name?.toString()?.toLowerCase() ?: "" }
 
     StringBuilder sb = new StringBuilder()
-    sb << (["Rule ID", "Rule", "App Type"] + SPECIAL_ACTION_KEYS.collect { String key -> labelForKeyword(key) } + ["Last Run"]).collect { escapeCsv(it) }.join(",") << "\n"
+    sb << (["Rule ID", "Rule", "App Type"] + SPECIAL_ACTION_KEYS.collect { String key -> labelForKeyword(key) } + ["Modes", "Last Run"]).collect { escapeCsv(it) }.join(",") << "\n"
     rows.each { Map r ->
         Map actions = normalizeKeywordMap(r.specialActions instanceof Map ? (Map) r.specialActions : [:])
         boolean unknown = r.specialUnknown == true
@@ -1098,6 +1299,7 @@ String buildRmCsv() {
         SPECIAL_ACTION_KEYS.each { String key ->
             vals << (unknown ? "?" : (actions[key] == true ? "Yes" : "No"))
         }
+        vals << (unknown ? "?" : normalizeModesList(r.modes).join(", "))
         vals << r.lastRun
         sb << vals.collect { escapeCsv(it) }.join(",") << "\n"
     }
@@ -1211,6 +1413,7 @@ String buildSharedReportAssets(String prefEndpoint = "") {
     sb << ".rmname-filter{padding:2px 6px;font-size:0.9em;border:1px solid #aaa;border-radius:3px;vertical-align:middle;}"
     sb << ".rmcheck-action-btn{display:inline-block;cursor:pointer;padding:2px 9px;margin-right:4px;border:1px solid #888;border-radius:3px;background:#f0f0f0;color:#333;font-weight:bold;user-select:none;}"
     sb << "table.rmlogcheck td.rmcol-special,table.rmlogcheck th.rmcol-special{width:94px;min-width:94px;}"
+    sb << "table.rmlogcheck td.rmcol-modes,table.rmlogcheck th.rmcol-modes{min-width:110px;}"
     sb << "</style>"
     sb << "<script>var rmPrefEndpoint = ${groovy.json.JsonOutput.toJson(prefEndpoint ?: null)};</script>"
 
@@ -1330,6 +1533,7 @@ String buildReportHtml(List<Map> rows) {
 
     boolean cfgHideColRuleId  = getPref("hideColRuleId",  false)
     boolean cfgHideColAppType = getPref("hideColAppType", false)
+    boolean cfgHideColModes   = getPref("hideColModes",   false)
     boolean cfgHideColLastRun = getPref("hideColLastRun", false)
 
     Map hideKeyword = [:]
@@ -1337,6 +1541,7 @@ String buildReportHtml(List<Map> rows) {
 
     String btnColRuleId  = cfgHideColRuleId  ? "rmcol-btn hidden-col" : "rmcol-btn"
     String btnColAppType = cfgHideColAppType ? "rmcol-btn hidden-col" : "rmcol-btn"
+    String btnColModes   = cfgHideColModes   ? "rmcol-btn hidden-col" : "rmcol-btn"
     String btnColLastRun = cfgHideColLastRun ? "rmcol-btn hidden-col" : "rmcol-btn"
 
     sb << "<div class='rmcol-toggle-bar'>"
@@ -1350,6 +1555,7 @@ String buildReportHtml(List<Map> rows) {
         String btnCls = hideKeyword[key] ? "rmcol-btn hidden-col" : "rmcol-btn"
         sb << "<span id='rmtoggle-${cls}' class='${btnCls}' data-pref-key='hideCol_${htmlEncode(key)}' onclick=\"toggleRmCol('${cls}',this)\">${htmlEncode(labelForKeyword(key))}</span>"
     }
+    sb << "<span id='rmtoggle-rmcol-modes' class='${btnColModes}' data-pref-key='hideColModes' onclick=\"toggleRmCol('rmcol-modes',this)\">Modes</span>"
     sb << "<span id='rmtoggle-rmcol-lastrun' class='${btnColLastRun}' data-pref-key='hideColLastRun' onclick=\"toggleRmCol('rmcol-lastrun',this)\">Last Run</span>"
     sb << "&nbsp;&nbsp;<b>Filter:</b>&nbsp;"
     sb << "<input id='rmname-filter' type='text' class='rmname-filter' placeholder='Filter rule name (substring or * ? wildcards)' oninput='applyRmRowFilters()' style='width:330px;'>"
@@ -1365,6 +1571,8 @@ String buildReportHtml(List<Map> rows) {
         sb << "<th onclick=\"sortRmLogTable('rmlog_table',${colIndex})\" class='center rmcol-special ${cls}'>${htmlEncode(labelForKeyword(key))}</th>"
         colIndex++
     }
+    sb << "<th onclick=\"sortRmLogTable('rmlog_table',${colIndex})\" class='center rmcol-modes'>Modes</th>"
+    colIndex++
     sb << "<th onclick=\"sortRmLogTable('rmlog_table',${colIndex})\" class='center rmcol-lastrun'>Last Run</th>"
     sb << "</tr></thead><tbody>"
 
@@ -1393,6 +1601,13 @@ String buildReportHtml(List<Map> rows) {
             String sortVal = unknown ? "1" : (found ? "2" : "0")
             sb << "<td class='center rmcol-special ${cls}' data-sort='${sortVal}'>${disp}</td>"
         }
+        List<String> modesList = normalizeModesList(r.modes)
+        String modesJoined = modesList.join(", ")
+        String modesDisp = unknown
+            ? "<span title='configure/json unknown or skipped' style='color:#c00;font-weight:bold;'>?</span>"
+            : (modesList ? htmlEncode(modesJoined) : "<span style='color:#aaa;'>—</span>")
+        String modesSort = unknown ? "" : htmlEncode(modesJoined.toLowerCase())
+        sb << "<td class='center rmcol-modes' data-sort='${modesSort}'>${modesDisp}</td>"
         sb << "<td class='center rmcol-lastrun' data-sort='${lastRun}'>${lastRun}</td>"
         sb << "</tr>"
     }
@@ -1405,6 +1620,7 @@ String buildReportHtml(List<Map> rows) {
     SPECIAL_ACTION_KEYS.each { String key ->
         if (hideKeyword[key]) colClassesToHide << "'${colClassForKeyword(key)}'"
     }
+    if (cfgHideColModes)   colClassesToHide << "'rmcol-modes'"
     if (cfgHideColLastRun) colClassesToHide << "'rmcol-lastrun'"
     if (colClassesToHide) {
         sb << "<script>setTimeout(function(){[${colClassesToHide.join(',')}].forEach(function(cls){document.querySelectorAll('.'+cls).forEach(function(el){el.style.display='none';});});},0);</script>"
@@ -1435,6 +1651,7 @@ void updateSpecialActionStats(List<Map> rows) {
 
     Integer ruleCount = 0
     Integer unknownCount = 0
+    Integer modeRuleCount = 0
 
     rows.each { Map r ->
         boolean unknown = r.specialUnknown == true
@@ -1450,12 +1667,14 @@ void updateSpecialActionStats(List<Map> rows) {
                 }
             }
             if (any) ruleCount++
+            if (normalizeModesList(r.modes)) modeRuleCount++
         }
     }
 
     state.specialActionRuleCount    = ruleCount
     state.specialActionUnknownCount = unknownCount
     state.specialActionCountsJson   = groovy.json.JsonOutput.toJson(counts)
+    state.modeRuleCount             = modeRuleCount
 }
 
 String labelForKeyword(String key) {
