@@ -1,12 +1,14 @@
-# RM/BC Rules Special Actions Scanner
+# RM/BC Special Actions Scanner
 
 A [Hubitat Elevation](https://hubitat.com/) app for Rule Machine (RM) and Button Controller (BC) rules.
 
-The app scans RM/BC rules and builds a sortable table showing whether each rule appears to contain selected Rule Machine special actions. It is intended as a read-only audit/reporting tool. It does **not** modify rules, Private Booleans, triggers, actions, or rule settings.
+The app scans RM/BC rules and builds a sortable table showing whether each rule appears to contain selected Rule Machine special actions, and which hub modes (if any) each rule uses. It is intended as a read-only audit/reporting tool. It does **not** modify rules, Private Booleans, triggers, actions, or rule settings.
 
 ---
 
 ## What It Detects
+
+### Special-action keywords
 
 The app searches each rule's internal configuration JSON for these Rule Machine keywords:
 
@@ -20,6 +22,21 @@ The app searches each rule's internal configuration JSON for these Rule Machine 
 | **Wait for Event** | `getWaitEvents` |
 
 A detected keyword usually means that the rule contains the corresponding type of special action, wait, or repeat structure.
+
+### Modes
+
+The app also parses each rule's configuration JSON and collects the hub modes the rule uses. It detects native `mode`-type inputs as well as Rule Machine's internal enum settings that hold mode selections:
+
+| Setting name pattern | Rule Machine usage |
+|----------------------|--------------------|
+| `modesX<n>` | Mode trigger selections (e.g. *Mode becomes Away*) |
+| `modes<n>` | Mode condition / required-expression selections (e.g. *Mode is Day*) |
+| `mode.<n>` | Set Mode action target (e.g. *Mode: Away*) |
+| `modesY<n>` | Legacy mode restrictions |
+
+Rule Machine stores these selections as mode **IDs**; the app translates them to mode names using this hub's own mode list (`location.getModes()`). Values that do not correspond to a mode defined on this hub are ignored, which filters out unrelated settings that happen to match a name pattern.
+
+Modes referenced only indirectly — for example via hub variables or custom commands — are not detected.
 
 ---
 
@@ -43,7 +60,7 @@ The scan has two phases:
 
 **Phase 1** reads each rule's runtime status JSON to collect basic report data, including **Last Run**.
 
-**Phase 2** reads each rule's internal configuration JSON and searches the raw JSON text for the six special-action keywords listed above.
+**Phase 2** reads each rule's internal configuration JSON, searches the raw JSON text for the six special-action keywords listed above, and parses the JSON to collect the rule's mode usage.
 
 Phase 2 uses a queued `configure/json` pass with only a small number of simultaneous requests. This helps prevent one very large rule or dropped response from stopping the rest of the scan. If a rule's configuration JSON cannot be read, that rule is marked as unknown/skipped.
 
@@ -53,6 +70,7 @@ After a scan, the top summary line shows:
 - **Rules with Special Actions**
 - **Unknown/skipped**
 - Counts for **While**, **Repeat**, **End Repeat**, **Stop Repeat**, **Wait for Expression**, and **Wait for Event**
+- **Rules using Modes**
 
 The scan-time line shows Phase 1 time, Phase 2 time, and total scan time.
 
@@ -75,6 +93,7 @@ The table lists every discovered RM and BC rule with the following columns:
 | **Stop Repeat** | Checkmark when `getStopRepeat` is detected |
 | **Wait for Expression** | Checkmark when `getWaitRule` is detected |
 | **Wait for Event** | Checkmark when `getWaitEvents` is detected |
+| **Modes** | Comma-separated list of the hub modes the rule uses (e.g. `Away, Day`) |
 | **Last Run** | Date and time of the most recent trigger event, formatted as `yyyy-MM-dd HH:mm` when available |
 
 ### Cell meanings
@@ -82,12 +101,13 @@ The table lists every discovered RM and BC rule with the following columns:
 | Cell | Meaning |
 |------|---------|
 | Green **✓** | The keyword was detected in this rule's configuration JSON |
-| Grey **—** | The keyword was not detected |
+| Mode names | The rule uses the listed hub modes (Modes column) |
+| Grey **—** | The keyword was not detected, or no mode settings were found |
 | Red **?** | The rule's configuration JSON could not be read, timed out, or was skipped |
 
 ### Sorting
 
-Click any column header to sort by that column. Click the same header again to reverse the sort direction.
+Click any column header to sort by that column. Click the same header again to reverse the sort direction. The Modes column sorts alphabetically by the mode-name list.
 
 ### Filtering
 
@@ -97,7 +117,7 @@ The filter state is browser-side and does not require clicking **Done**.
 
 ### Hide rows with no Special Actions
 
-Click **Hide rows with no Special Actions** to hide rows where all six keyword columns are known and none of the keywords were detected.
+Click **Hide rows with no Special Actions** to hide rows where all six keyword columns are known and none of the keywords were detected. Mode usage does not affect this filter.
 
 Rows marked with a red **?** remain visible, because the app could not determine whether those rules contain special actions.
 
@@ -115,6 +135,7 @@ The hide-column buttons above the table let you show or hide:
 - Stop Repeat
 - Wait for Expression
 - Wait for Event
+- Modes
 - Last Run
 
 Column visibility persists without clicking **Done**.
@@ -128,13 +149,15 @@ In the **Controls** section, after a scan:
 - **Open Printable Report** opens a formatted HTML report of the scanned rules.
 - **Download CSV** downloads the same table data as a CSV file.
 
-Reports use the cached data from the most recent scan.
+Reports use the cached data from the most recent scan and include the Modes column.
 
 The CSV export uses the friendly column labels:
 
 ```text
-Rule ID, Rule, App Type, While, Repeat, End Repeat, Stop Repeat, Wait for Expression, Wait for Event, Last Run
+Rule ID, Rule, App Type, While, Repeat, End Repeat, Stop Repeat, Wait for Expression, Wait for Event, Modes, Last Run
 ```
+
+In the CSV, the Modes value is the comma-separated mode-name list (blank when the rule uses no modes, `?` when the rule was unknown/skipped).
 
 ---
 
@@ -158,7 +181,8 @@ When **Enable debug logging** is turned on in the Controls section, additional o
 - **Lifecycle events** — install, update, rename, and scan-cancel events
 - **Rule discovery count** — number of RM/BC rules found from `/hub2/appsList`
 - **Per-rule Phase 1 results** — rule name, ID, app type, and Last Run data as rules are scanned
-- **Per-rule Phase 2 results** — keyword-detection results from each rule's `configure/json` response
+- **Per-rule Phase 2 results** — keyword-detection and mode-detection results from each rule's `configure/json` response
+- **Hub mode map** — the mode ID → name map read from the hub at the start of Phase 2
 - **Phase 2 queue progress** — active request count, completed count, and watchdog activity
 - **Timeout/unknown handling** — rules whose configuration JSON could not be read within the timeout
 - **Re-render-from-cache confirmations** — when the table is rebuilt from cached data on Done press
@@ -175,10 +199,12 @@ The app uses the following Hubitat local/internal endpoints:
 |----------|---------|
 | `/hub2/appsList` | Discover RM and BC rules |
 | `/installedapp/statusJson/{appId}` | Read per-rule status data, including Last Run, during Phase 1 |
-| `/installedapp/configure/json/{appId}` | Read per-rule configuration JSON for keyword detection during Phase 2 |
+| `/installedapp/configure/json/{appId}` | Read per-rule configuration JSON for keyword and mode detection during Phase 2 |
 | `/apps/api/{appId}/setpref` | Persist column-hide preferences |
 | `/apps/api/{appId}/report` | Printable HTML report |
 | `/apps/api/{appId}/RM-BC_Special_Actions.csv` | CSV export |
+
+Mode ID → name translation uses the standard app API `location.getModes()` rather than an internal endpoint. The mode map is rebuilt at the start of each Phase 2 pass, so mode renames on the hub are picked up on the next scan.
 
 > **Warning:** The `/hub2/appsList`, `/installedapp/statusJson/`, and `/installedapp/configure/json/` endpoints are internal Hubitat APIs and are not formal public APIs. They could change in a future Hubitat platform update.
 
@@ -187,6 +213,8 @@ The app uses the following Hubitat local/internal endpoints:
 ## Limitations
 
 - **Read-only keyword detection.** The app detects the presence of selected internal keyword strings. It does not parse or understand the full logical structure of the rule.
+- **Mode detection depends on Rule Machine's setting names.** Modes are found by matching Rule Machine's internal setting-name conventions (`modesX<n>`, `modes<n>`, `mode.<n>`, `modesY<n>`) and native `mode`-type inputs. A future Rule Machine version that introduces a new convention would require a small pattern update in the app.
+- **Indirect mode references are not detected.** Rules that set or test modes via hub variables or custom commands will show no modes.
 - **Internal Hubitat APIs.** The app relies on internal JSON endpoints whose structure could change in future Hubitat platform versions.
 - **Large Phase 2 responses.** Very large rule configuration JSON may time out or be dropped. The affected rule will show a red **?**, and the scan will continue.
 - **Unknown rows are preserved by the row filter.** Unknown/skipped rows remain visible when **Hide rows with no Special Actions** is active, because the app cannot safely classify them as having no special actions.
