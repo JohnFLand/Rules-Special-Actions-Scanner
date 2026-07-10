@@ -36,6 +36,55 @@
  *  unrelated settings that happen to match the name pattern. "mode"-type inputs
  *  are still detected as before.
  *
+ *  1.08: Adds stale-match detection for special-action keywords. Rule Machine
+ *  never garbage-collects deleted actions: their settings, clipboard entries
+ *  (clipList), and old variable settings (varSettingsOld) remain in the rule's
+ *  stored configuration forever, so the previous whole-text keyword search
+ *  reported special actions that are no longer part of the rule ("false
+ *  positives"). Phase 1 now also captures the rule's live action keys from the
+ *  statusJson appState entries whose names begin with "actionList" (RM's
+ *  authoritative list of the actions the rule actually still contains). In
+ *  Phase 2, every keyword occurrence in the configuration JSON has its numeric
+ *  index suffix (e.g. the "2.1" in "repeatActs2.1") checked against that live
+ *  key set:
+ *      - at least one occurrence maps to a live action  -> live (green check)
+ *      - occurrences exist but none maps to a live key  -> stale (orange check)
+ *      - no occurrence                                  -> not found (dash)
+ *  Stale matches indicate leftover cruft from deleted actions, clipboard
+ *  copies, or old settings — useful when hunting rules that need cleanup. A
+ *  new "Treat stale-only keyword matches as not found" toggle (Controls
+ *  section) renders stale matches as dashes instead, for anyone who just
+ *  wants them suppressed; it re-renders from cached scan data, no re-scan
+ *  needed. If no live action-key set could be read for a rule (older platform,
+ *  unreadable statusJson, empty actionList), detection falls back to the
+ *  previous behavior and reports every keyword hit as live rather than risk
+ *  false negatives. The suffix/actionList key formats are a best-guess match
+ *  against RM 5.x internals and are not a formal public API.
+ *
+ *  1.09: Phase 2 reliability fixes for large installs (300+ rules) and slow
+ *  hubs, based on a scan that hit the fixed 10-minute Phase 2 cap with 100+
+ *  rules left unscanned, dozens of HTTP 408 timeouts, and a
+ *  ConcurrentModificationException in configurePump:
+ *  - The Phase 2 total-timeout backstop now scales with rule count instead
+ *    of a fixed 600 seconds, so big scans are no longer cut off mid-queue.
+ *    The heartbeat still catches genuinely stalled scans within 30 seconds.
+ *  - Rules whose configure/json request times out (HTTP 408 / watchdog) or
+ *    fails are automatically retried once, with a longer 90-second timeout,
+ *    at the back of the queue. Only rules that fail both attempts are marked
+ *    unknown. A late-arriving success for a request the watchdog had already
+ *    given up on is also accepted instead of discarded.
+ *  - The heartbeat no longer treats slow-but-bounded in-flight requests as a
+ *    stall; it only fires when nothing is in flight and nothing is being
+ *    launched.
+ *  - All Phase 2 shared state (in-flight map, results, counters, retry
+ *    bookkeeping) is now guarded by a lock. Previously the pump iterated the
+ *    in-flight map while concurrent async callbacks mutated it, causing the
+ *    ConcurrentModificationException; finalize could also run concurrently
+ *    from the heartbeat, the total-timeout, and normal completion.
+ *  - When Phase 2 ends before every rule was scanned, the log and the app
+ *    page now say so explicitly (how many rules were never reached), instead
+ *    of a "Phase 2 complete" message that looked like a normal finish.
+ *
  *  Notes:
  *  - Uses Hubitat local/internal JSON endpoints:
  *      /hub2/appsList
@@ -55,8 +104,10 @@ import groovy.transform.CompileStatic
 @Field static final int    SCAN_TIMEOUT_SECS              = 360   // max seconds before Phase 1 scan is force-finalized
 @Field static final int    LOGS_OFF_DELAY_SECS            = 1800  // seconds before debug logging auto-disables
 @Field static final int    CONFIGURE_MAX_IN_FLIGHT        = 3     // max simultaneous configure/json requests during keyword scan
-@Field static final int    CONFIGURE_REQUEST_TIMEOUT_SECS = 20    // per-rule watchdog timeout for configure/json callbacks
-@Field static final int    CONFIGURE_TOTAL_TIMEOUT_SECS   = 600   // max seconds before Phase 2 scan is force-finalized
+@Field static final int    CONFIGURE_REQUEST_TIMEOUT_SECS = 20    // per-rule watchdog timeout for configure/json callbacks (first attempt)
+@Field static final int    CONFIGURE_RETRY_TIMEOUT_SECS   = 90    // per-rule timeout for the retry attempt (slow BC/RM pages)
+@Field static final int    CONFIGURE_MAX_ATTEMPTS         = 2     // attempts per rule before its special actions are marked unknown
+@Field static final int    CONFIGURE_TOTAL_TIMEOUT_SECS   = 600   // minimum backstop before Phase 2 is force-finalized; scaled up with rule count at scan start
 @Field static final int    CONFIGURE_HEARTBEAT_SECS       = 30    // silence timeout for Phase 2 progress
 
 @Field static final List<String> SPECIAL_ACTION_KEYS = [
@@ -92,6 +143,9 @@ import groovy.transform.CompileStatic
 @Field static Integer   configureTotalRules     = 0      // total number of rules expected in Phase 2
 @Field static Map       configureInflight       = [:]    // ruleId -> [startedMs, name], for dropped-response watchdog
 @Field static Map       modeIdToName            = null   // hub mode ID -> mode name, built at Phase 2 start
+@Field static Map       configureLiveKeys       = [:]    // ruleId -> List<String> live action keys captured from Phase 1 statusJson
+@Field static Map       configureAttempts       = [:]    // ruleId -> number of configure/json attempts launched
+@Field static final Object PHASE2_LOCK          = new Object()  // guards all Phase 2 shared state above (pump, callbacks, heartbeat, finalize can run on different threads)
 
 // RM/BC mode-selection setting names: modesX<n> (triggers), modes<n> (conditions),
 // mode.<n> (Set Mode action target), modesY<n> (legacy restrictions), plus bare
@@ -99,7 +153,7 @@ import groovy.transform.CompileStatic
 @Field static final java.util.regex.Pattern MODE_SETTING_NAME_PATTERN = ~/^modes?[XY]?\d*(\.\d+)?$/
 
 definition(
-    name:           "Rules Special Actions Scanner 1.07",
+    name:           "Rules Special Actions Scanner 1.09",
     namespace:      "John Land",
     author:         "John Land & AI",
     description:    "Scans RM/BC rules and reports selected special-action keywords found in rule configuration JSON.",
@@ -204,14 +258,18 @@ void initialize() {
     unschedule("configureHeartbeat")
 
     state.remove("scanRuleQueue")
-    configureScanId         = null
-    configureQueue          = null
-    configureResults        = [:]
-    configureNextIdx        = 0
-    configureInFlight       = 0
-    configureTotalRules     = 0
-    configureInflight       = [:]
-    modeIdToName            = null
+    synchronized (PHASE2_LOCK) {
+        configureScanId         = null
+        configureQueue          = null
+        configureResults        = [:]
+        configureNextIdx        = 0
+        configureInFlight       = 0
+        configureTotalRules     = 0
+        configureInflight       = [:]
+        modeIdToName            = null
+        configureLiveKeys       = [:]
+        configureAttempts       = [:]
+    }
 
     unsubscribe()
 
@@ -331,6 +389,14 @@ def mainPage() {
     checkOAuth()
     syncAppInstanceLabel()
 
+    // Re-render the cached report immediately when the stale-suppression
+    // toggle changes (submitOnChange re-runs this page before Done is clicked).
+    boolean curSuppress = isSuppressStaleEnabled()
+    if (state.suppressStaleRendered != null && state.suppressStaleRendered != curSuppress) {
+        reRenderReportIfCached()
+    }
+    state.suppressStaleRendered = curSuppress
+
     int pollInterval = (currentScanId || configureScanId) ? 5 : 0
 
     dynamicPage(name: "mainPage", title: "<b>${htmlEncode(getAppDisplayName())}</b>", install: true, uninstall: true, refreshInterval: pollInterval) {
@@ -393,6 +459,15 @@ def mainPage() {
             }
 
             paragraph "<br><br>"
+            input "suppressStale", "bool",
+                title: "<b>Treat stale-only keyword matches as not found</b>",
+                defaultValue:   false,
+                submitOnChange: true
+            paragraph "<small>Keyword matches found only in stale/leftover rule entries (deleted actions, " +
+                      "clipboard copies, old settings — anything no longer referenced by the rule's actionList) " +
+                      "are normally shown as an orange checkmark. Turn this on to show them as a dash instead. " +
+                      "Takes effect immediately from cached scan data; no re-scan needed.</small>"
+
             input "debugEnable", "bool",
                 title: "<b>Enable debug logging</b>",
                 defaultValue:   false,
@@ -411,10 +486,32 @@ def mainPage() {
                 <br><br>
                 <b>Scanning</b><br>
                 The scan has two phases. Phase 1 reads each rule's runtime status JSON to get
-                Last Run. Phase 2 reads each rule's configuration JSON and searches the raw JSON
-                text for the six keywords. Phase 2 is queued with a small number of simultaneous
-                requests so very large rules or dropped responses should mark only the affected
-                rule as unknown instead of stopping the whole scan.
+                Last Run, and also captures the rule's <i>live action keys</i> from state
+                variables whose names begin with <code>actionList</code> — Rule Machine's list of
+                the actions the rule actually still contains. Phase 2 reads each rule's
+                configuration JSON and searches it for the six keywords. Phase 2 is queued with
+                a small number of simultaneous requests; a rule whose request times out or fails
+                is automatically retried once with a longer timeout, and only rules that fail
+                both attempts are marked unknown. The overall Phase 2 time limit scales with the
+                number of rules, so large installs are not cut off mid-scan; if Phase 2 ever
+                does end early, the app page and log state how many rules were never reached.
+                <br><br>
+                <b>Live vs. stale matches</b><br>
+                Rule Machine never garbage-collects deleted actions: their settings, clipboard
+                entries (<code>clipList</code>), and old variable settings
+                (<code>varSettingsOld</code>) can remain in a rule's stored configuration
+                indefinitely. Each keyword occurrence carries an action index (e.g. the
+                <code>2.1</code> in <code>repeatActs2.1</code>); if none of a keyword's
+                occurrences maps to a live action key from the rule's <code>actionList</code>,
+                the match is classified as <b>stale</b> and shown as an
+                <span style='color:#d98800;font-weight:bold;'>orange checkmark</span> — leftover
+                cruft, useful when hunting rules that need cleanup. The <b>Treat stale-only
+                keyword matches as not found</b> toggle in Controls shows them as dashes instead.
+                If a rule's live action-key list could not be read (or is empty), classification
+                falls back to the pre-1.08 behavior and every keyword hit is shown as live, so
+                unreadable rules never produce false negatives. The action-key formats are a
+                best-guess match against current Rule Machine internals and are not a formal
+                public API.
                 <br><br>
                 <b>Modes column</b><br>
                 During Phase 2 the configuration JSON is also parsed and searched for mode
@@ -431,12 +528,16 @@ def mainPage() {
                 <br><br>
                 <b>Table</b><br>
                 Shows Rule ID, Rule name (linked to its config page), App Type, one column for
-                each keyword, Modes, and Last Run. Keyword cells show a green checkmark when the keyword
-                is found, a dash when it is not found, or a red question mark when the rule's
-                configuration JSON could not be read.
+                each keyword, Modes, and Last Run. Keyword cells show a green checkmark when the
+                keyword is found in a live action, an orange checkmark when it is found only in
+                stale/leftover entries, a dash when it is not found, or a red question mark when
+                the rule's configuration JSON could not be read. Summary keyword counts include
+                live matches only; stale-only rules are counted separately.
                 <br><br>
                 The <b>Hide rows with no Special Actions</b> button hides rows where all six
-                keyword columns are known and none is present. Unknown/skipped rows remain visible.
+                keyword columns are known and none is present. Unknown/skipped rows and rows with
+                stale-only matches remain visible (unless stale matches are suppressed via the
+                Controls toggle, in which case stale-only rows are hidden too).
                 The <b>Show all rows</b> button restores them. Column headers are clickable to sort.
                 The hide-column buttons persist without clicking <b>Done</b>.
                 <br><br>
@@ -459,7 +560,9 @@ String buildSummaryHtml() {
     sb << "<div id='rm-summary' style='margin:0;padding:0;line-height:1.5;font-size:1em;'>"
     sb << "<b>Rules scanned:</b> ${state.scannedCount ?: 0}; "
     sb << "<b>Rules with Special Actions:</b> ${state.specialActionRuleCount ?: 0}; "
-    sb << "<b>Unknown/skipped:</b> ${state.specialActionUnknownCount ?: 0}"
+    sb << "<b>Rules with stale keyword leftovers:</b> ${state.staleMatchRuleCount ?: 0}"
+    if (isSuppressStaleEnabled()) sb << " <i>(shown as not found)</i>"
+    sb << "; <b>Unknown/skipped:</b> ${state.specialActionUnknownCount ?: 0}"
     SPECIAL_ACTION_KEYS.each { String key ->
         sb << "; <b>${htmlEncode(labelForKeyword(key))}:</b> ${counts[key] ?: 0}"
     }
@@ -594,8 +697,10 @@ void handleStatusResponse(resp, data) {
 
         if (scanPartialResults == null) scanPartialResults = [:]
 
+        List<String> liveKeys = extractLiveActionKeys(status)
+
         if (debugEnable) {
-            log.debug "Scanned status: ${data.ruleName} (${ruleId}, ${data.appType}) LastRun=${extractLastRun(status)}"
+            log.debug "Scanned status: ${data.ruleName} (${ruleId}, ${data.appType}) LastRun=${extractLastRun(status)}, liveActionKeys=${liveKeys}"
         }
 
         scanPartialResults[ruleId] = [
@@ -603,6 +708,7 @@ void handleStatusResponse(resp, data) {
             name           : data.ruleName,
             appType        : data.appType,
             lastRun        : extractLastRun(status),
+            liveKeys       : liveKeys,
             specialActions : emptyKeywordCounts(),
             specialUnknown : true,
             modes          : []
@@ -616,6 +722,7 @@ void handleStatusResponse(resp, data) {
             name           : data.ruleName as String,
             appType        : (data.appType ?: "RM") as String,
             lastRun        : "",
+            liveKeys       : [],
             specialActions : emptyKeywordCounts(),
             specialUnknown : true,
             modes          : []
@@ -659,14 +766,32 @@ void resetConfigureHeartbeat(String reason = "") {
 void configureHeartbeat() {
     if (configureScanId == null) return
 
-    Integer done   = (configureResults?.size() ?: 0) as Integer
-    Integer total  = (configureTotalRules ?: 0) as Integer
-    Integer active = (configureInFlight ?: 0) as Integer
-    Integer next   = (configureNextIdx ?: 0) as Integer
+    Integer done; Integer total; Integer active; Integer next
+    synchronized (PHASE2_LOCK) {
+        done   = (configureResults?.size() ?: 0) as Integer
+        total  = (configureTotalRules ?: 0) as Integer
+        active = (configureInFlight ?: 0) as Integer
+        next   = (configureNextIdx ?: 0) as Integer
+    }
 
     log.warn "SAS: Phase 2 heartbeat timeout — no configure/json progress for ${CONFIGURE_HEARTBEAT_SECS}s; finalizing partial results. Done=${done}/${total}, active=${active}, nextIdx=${next}"
 
     finalizeUsageScan()
+}
+
+// Move a failed rule (timeout, non-200, unparseable) back to the end of the
+// queue for another attempt, or mark it unknown once its attempts are used
+// up. Returns true when a retry was queued. Callers must hold PHASE2_LOCK.
+private boolean requeueOrMarkUnknown(String rid, String nm, String reason) {
+    int attempts = (configureAttempts?.get(rid) ?: 0) as int
+    if (attempts < CONFIGURE_MAX_ATTEMPTS && configureQueue != null) {
+        log.warn "SAS: configure/json ${reason} for rule ${rid} (${nm}) — will retry with a ${CONFIGURE_RETRY_TIMEOUT_SECS}s timeout (${attempts} of ${CONFIGURE_MAX_ATTEMPTS} attempts used)"
+        configureQueue << [id: rid, name: nm]
+        return true
+    }
+    log.warn "SAS: configure/json ${reason} for rule ${rid} (${nm}) — special actions marked unknown after ${attempts} attempt(s)"
+    configureResults[rid] = null
+    return false
 }
 
 void configurePump() {
@@ -675,75 +800,89 @@ void configurePump() {
     unschedule("configurePump")
 
     boolean madeProgress = false
+    Integer done; Integer total; Integer active
 
-    Long nowMs = now() as Long
-    if (configureResults  == null) configureResults  = [:]
-    if (configureInflight == null) configureInflight = [:]
+    synchronized (PHASE2_LOCK) {
+        Long nowMs = now() as Long
+        if (configureResults  == null) configureResults  = [:]
+        if (configureInflight == null) configureInflight = [:]
+        if (configureAttempts == null) configureAttempts = [:]
 
-    List<String> expiredIds = []
-    configureInflight.each { String rid, Object infoObj ->
-        Map info = (infoObj instanceof Map) ? (Map) infoObj : [:]
-        Long startedMs = (info.startedMs ?: 0L) as Long
-        if (startedMs && (nowMs - startedMs) > (CONFIGURE_REQUEST_TIMEOUT_SECS * 1000L)) {
-            expiredIds << rid
+        // Watchdog: expire in-flight requests that have exceeded the timeout
+        // used for their attempt (plus a small grace period), then retry or
+        // mark them unknown. Iterate over a snapshot of the keys — the map is
+        // mutated below.
+        List<String> inflightIds = new ArrayList<String>(configureInflight.keySet())
+        inflightIds.each { String rid ->
+            Map info = (configureInflight[rid] instanceof Map) ? (Map) configureInflight[rid] : [:]
+            Long startedMs   = (info.startedMs ?: 0L) as Long
+            int  timeoutSecs = (info.timeoutSecs ?: CONFIGURE_REQUEST_TIMEOUT_SECS) as int
+            if (startedMs && (nowMs - startedMs) > ((timeoutSecs + 5) * 1000L)) {
+                requeueOrMarkUnknown(rid, (info.name ?: "") as String, "watchdog timeout (${timeoutSecs}s)")
+                configureInflight.remove(rid)
+                configureInFlight = Math.max(0, (configureInFlight ?: 0) - 1)
+                madeProgress = true
+            }
         }
-    }
 
-    expiredIds.each { String rid ->
-        Map info = (configureInflight[rid] instanceof Map) ? (Map) configureInflight[rid] : [:]
-        log.warn "SAS: configure/json timeout for rule ${rid} (${info.name ?: ''}) — special actions marked unknown"
-        configureResults[rid] = null
-        configureInflight.remove(rid)
-        configureInFlight = Math.max(0, (configureInFlight ?: 0) - 1)
-        madeProgress = true
-    }
+        while ((configureInFlight ?: 0) < CONFIGURE_MAX_IN_FLIGHT &&
+               (configureNextIdx  ?: 0) < (configureQueue?.size() ?: 0)) {
 
-    while ((configureInFlight ?: 0) < CONFIGURE_MAX_IN_FLIGHT &&
-           (configureNextIdx  ?: 0) < (configureQueue?.size() ?: 0)) {
+            Map rule = configureQueue[configureNextIdx] as Map
+            configureNextIdx = (configureNextIdx ?: 0) + 1
 
-        Map rule = configureQueue[configureNextIdx] as Map
-        configureNextIdx = (configureNextIdx ?: 0) + 1
+            String rid   = rule.id as String
+            String nm    = rule.name as String
+            String cfgId = configureScanId
 
-        String rid   = rule.id as String
-        String nm    = rule.name as String
-        String cfgId = configureScanId
+            // Skip anything already resolved (e.g., a late response arrived
+            // for a rule that had also been requeued for retry).
+            if (configureResults.containsKey(rid) || configureInflight.containsKey(rid)) continue
 
-        configureInflight[rid] = [startedMs: nowMs, name: nm]
-        configureInFlight = (configureInFlight ?: 0) + 1
-        madeProgress = true
+            int attempt = ((configureAttempts[rid] ?: 0) as int) + 1
+            configureAttempts[rid] = attempt
+            int tmo = (attempt >= 2) ? CONFIGURE_RETRY_TIMEOUT_SECS : CONFIGURE_REQUEST_TIMEOUT_SECS
 
-        try {
-            asynchttpGet(
-                "handleConfigureResponse",
-                [
-                    uri     : RM_BASE_URL,
-                    path    : "/installedapp/configure/json/${rid}",
-                    timeout : CONFIGURE_REQUEST_TIMEOUT_SECS
-                ],
-                [
-                    cfgScanId : cfgId,
-                    ruleId    : rid,
-                    ruleName  : nm
-                ]
-            )
-        } catch (Exception e) {
-            log.warn "SAS: could not start configure/json for rule ${rid} (${nm}) — special actions marked unknown: ${e.message}"
-            configureResults[rid] = null
-            configureInflight.remove(rid)
-            configureInFlight = Math.max(0, (configureInFlight ?: 0) - 1)
+            configureInflight[rid] = [startedMs: nowMs, name: nm, timeoutSecs: tmo]
+            configureInFlight = (configureInFlight ?: 0) + 1
             madeProgress = true
-        }
-    }
 
-    Integer done   = (configureResults?.size() ?: 0) as Integer
-    Integer total  = (configureTotalRules ?: 0) as Integer
-    Integer active = (configureInFlight ?: 0) as Integer
+            try {
+                asynchttpGet(
+                    "handleConfigureResponse",
+                    [
+                        uri     : RM_BASE_URL,
+                        path    : "/installedapp/configure/json/${rid}",
+                        timeout : tmo
+                    ],
+                    [
+                        cfgScanId : cfgId,
+                        ruleId    : rid,
+                        ruleName  : nm
+                    ]
+                )
+            } catch (Exception e) {
+                log.warn "SAS: could not start configure/json for rule ${rid} (${nm}): ${e.message}"
+                configureInflight.remove(rid)
+                configureInFlight = Math.max(0, (configureInFlight ?: 0) - 1)
+                requeueOrMarkUnknown(rid, nm, "launch failure")
+                madeProgress = true
+            }
+        }
+
+        done   = (configureResults?.size() ?: 0) as Integer
+        total  = (configureTotalRules ?: 0) as Integer
+        active = (configureInFlight ?: 0) as Integer
+    }
 
     if (total > 0) {
         state.scanStatus = "<i>Phase 2: checking configure/json for special-action keywords… ${done}/${total} complete, ${active} active</i>"
     }
 
-    if (madeProgress) {
+    // The scan is not stalled while bounded requests are still in flight —
+    // the watchdog above guarantees each one resolves. Only reset-starve the
+    // heartbeat when nothing is in flight and nothing was launched.
+    if (madeProgress || (active ?: 0) > 0) {
         resetConfigureHeartbeat("pump progress")
     }
 
@@ -762,45 +901,137 @@ void handleConfigureResponse(resp, data) {
     String ruleId   = data.ruleId as String
     String ruleName = data.ruleName ?: ""
 
-    if (configureResults?.containsKey(ruleId) && !configureInflight?.containsKey(ruleId)) {
-        return
-    }
-
-    Map resultMap = null
+    // Parse the response outside the lock — only bookkeeping is guarded.
+    Map    resultMap  = null
+    String failReason = null
 
     try {
         int httpStatus = resp.getStatus() as int
         if (httpStatus == 200) {
             Object raw = resp.getData()
-            Map          foundMap  = detectSpecialActionsFromRaw(raw)
+            Set<String>  liveKeys  = liveKeysForRule(ruleId)
+            Map          foundMap  = detectSpecialActionsFromRaw(raw, liveKeys)
             List<String> modesList = detectModesFromRaw(raw)
             if (foundMap != null) {
                 resultMap = [keywords: foundMap, modes: (modesList ?: [])]
+            } else {
+                failReason = "unparseable payload"
             }
             if (debugEnable) log.debug "configure/json ${ruleId}: specialActions=${foundMap}, modes=${modesList}"
         } else {
-            log.warn "configure/json HTTP ${httpStatus} for rule ${ruleId} (${ruleName})"
+            failReason = "HTTP ${httpStatus}"
         }
     } catch (Exception e) {
         log.warn "handleConfigureResponse ${ruleId} (${ruleName}): ${e.message}"
-        resultMap = null
+        resultMap  = null
+        failReason = failReason ?: "callback error"
     }
 
     if (configureScanId != cfgScanId) return
 
-    if (configureResults == null)  configureResults  = [:]
-    if (configureInflight == null) configureInflight = [:]
+    synchronized (PHASE2_LOCK) {
+        if (configureScanId != cfgScanId) return
+        if (configureResults == null)  configureResults  = [:]
+        if (configureInflight == null) configureInflight = [:]
 
-    configureResults[ruleId] = resultMap
-    configureInflight.remove(ruleId)
-    configureInFlight = Math.max(0, (configureInFlight ?: 0) - 1)
+        boolean wasInflight = configureInflight.containsKey(ruleId)
+
+        if (!wasInflight) {
+            // The watchdog already expired this attempt. A late success is
+            // still useful: record it (or upgrade an unknown), so a pending
+            // retry gets skipped and the rule doesn't show as '?'.
+            if (resultMap != null && (!configureResults.containsKey(ruleId) || configureResults[ruleId] == null)) {
+                if (debugEnable) log.debug "SAS: late configure/json success for rule ${ruleId} (${ruleName}) accepted"
+                configureResults[ruleId] = resultMap
+            }
+            return
+        }
+
+        configureInflight.remove(ruleId)
+        configureInFlight = Math.max(0, (configureInFlight ?: 0) - 1)
+
+        if (resultMap != null) {
+            configureResults[ruleId] = resultMap
+        } else {
+            requeueOrMarkUnknown(ruleId, ruleName, failReason ?: "unknown failure")
+        }
+    }
 
     resetConfigureHeartbeat("callback")
 
     configurePump()
 }
 
-private Map detectSpecialActionsFromRaw(Object raw) {
+// Extract the rule's live action keys from its statusJson payload. RM keeps
+// the authoritative list of a rule's current actions in state variables whose
+// names begin with "actionList" (RM 5.x: "actionList"; Button Controller may
+// keep one list per button). Everything else in the "actions" HashMap /
+// settings that is not referenced there is leftover cruft from deleted
+// actions. statusJson appState item values arrive as strings (e.g.
+// "[2.1, 2.3, 3]" or JSON-ish text), so the keys are harvested liberally as
+// dotted numeric tokens rather than by parsing a specific format.
+private List<String> extractLiveActionKeys(Map status) {
+    Set<String> keys = [] as Set
+    try {
+        status?.appState?.each { item ->
+            String n = item?.name?.toString() ?: ""
+            if (n.startsWith("actionList")) {
+                String v = item?.value?.toString() ?: ""
+                java.util.regex.Matcher m = (v =~ /\d+(?:\.\d+)*/)
+                while (m.find()) { keys << m.group() }
+            }
+        }
+    } catch (Exception e) {
+        log.warn "extractLiveActionKeys: ${e.message}"
+    }
+    return keys as List
+}
+
+// Fetch the Phase 1 live action keys for a rule as a Set (null if none stored).
+private Set<String> liveKeysForRule(String ruleId) {
+    try {
+        Object lk = configureLiveKeys?.get(ruleId)
+        if (lk instanceof List) {
+            return ((List) lk).collect { it?.toString() }.findAll { it } as Set
+        }
+    } catch (Exception e) {
+        log.warn "liveKeysForRule ${ruleId}: ${e.message}"
+    }
+    return null
+}
+
+// True when an index suffix taken from a keyword occurrence (e.g. the "2.1"
+// in "repeatActs2.1") refers to a live action. Matching is deliberately
+// liberal to avoid false negatives:
+//   - a bare keyword with no suffix cannot be judged, so it counts as live;
+//   - exact match against the live key set counts as live;
+//   - dotted prefixes count ("2.1.3" is live when action "2.1" or "2" is);
+//   - nested live keys count in reverse ("2" is live when "2.1" is live).
+private boolean isActionKeyLive(String suffix, Set<String> liveKeys) {
+    if (!suffix) return true
+    if (liveKeys.contains(suffix)) return true
+
+    String s = suffix
+    while (s.indexOf('.') >= 0) {
+        s = s.substring(0, s.lastIndexOf('.'))
+        if (liveKeys.contains(s)) return true
+    }
+
+    String pfx = suffix + "."
+    return liveKeys.any { Object k -> k?.toString()?.startsWith(pfx) }
+}
+
+// Classify each special-action keyword in the configure/json payload as:
+//   true    - at least one occurrence refers to a live action
+//   "stale" - occurrences exist, but none refers to a live action (leftover
+//             settings from deleted actions, clipList clipboard copies,
+//             varSettingsOld, etc.)
+//   false   - keyword not present at all
+// When no live action-key set is available for the rule (unreadable
+// statusJson, no actionList state variable, or an empty list — which could
+// also mean this platform version stores it differently), classification
+// falls back to the pre-1.08 behavior and reports every occurrence as live.
+private Map detectSpecialActionsFromRaw(Object raw, Set<String> liveKeys) {
     try {
         if (raw == null) return null
 
@@ -811,9 +1042,30 @@ private Map detectSpecialActionsFromRaw(Object raw) {
             jsonText = groovy.json.JsonOutput.toJson(raw)
         }
 
+        boolean haveLiveInfo = (liveKeys != null && !liveKeys.isEmpty())
+
         Map found = [:]
         SPECIAL_ACTION_KEYS.each { String key ->
-            found[key] = jsonText.contains(key)
+            if (!jsonText.contains(key)) {
+                found[key] = false
+                return
+            }
+            if (!haveLiveInfo) {
+                found[key] = true
+                return
+            }
+
+            boolean anyLive = false
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile(java.util.regex.Pattern.quote(key) + /(\d+(?:\.\d+)*)?/)
+                .matcher(jsonText)
+            while (m.find()) {
+                if (isActionKeyLive(m.group(1), liveKeys)) {
+                    anyLive = true
+                    break
+                }
+            }
+            found[key] = anyLive ? true : "stale"
         }
         return found
     } catch (Exception e) {
@@ -972,15 +1224,39 @@ void finalizeUsageScan() {
     unschedule("configureHeartbeat")
 
     state.scanStatus = null
-    if (configureScanId == null) return
+
+    Map     cfgRes     = null
+    Integer totalRules = 0
+
+    // Take ownership of the scan under the lock: null the scan ID first so
+    // any late callbacks, pumps, or a second concurrent finalize (heartbeat
+    // vs. total-timeout vs. normal completion) bail out cleanly, then
+    // snapshot and clear the shared state.
+    synchronized (PHASE2_LOCK) {
+        if (configureScanId == null) return
+        configureScanId = null
+        cfgRes     = new HashMap(configureResults ?: [:])
+        totalRules = (configureTotalRules ?: 0) as Integer
+
+        configureQueue          = null
+        configureResults        = null
+        configureNextIdx        = 0
+        configureInFlight       = 0
+        configureTotalRules     = 0
+        configureInflight       = [:]
+        configureAttempts       = [:]
+        configureLiveKeys       = [:]
+    }
+
     log.info "SAS: Phase 2 finalizing"
 
     try {
         List<Map> rows = new groovy.json.JsonSlurper().parseText(state.scanRowsJson ?: "[]") as List<Map>
-        Map cfgRes = configureResults ?: [:]
+        int neverScanned = 0
         rows = rows.collect { Map r ->
             String id = r.id?.toString()
             Object res = cfgRes.containsKey(id) ? cfgRes[id] : null
+            if (!cfgRes.containsKey(id)) neverScanned++
             Map resMap = (res instanceof Map) ? (Map) res : null
             if (resMap != null && resMap.get("keywords") instanceof Map) {
                 r.specialActions = normalizeKeywordMap(resMap.get("keywords") as Map)
@@ -1009,18 +1285,15 @@ void finalizeUsageScan() {
         state.scanRowsJson       = groovy.json.JsonOutput.toJson(rows)
         state.reportHtml         = buildReportHtml(rows)
 
+        if (neverScanned > 0) {
+            log.warn "SAS: Phase 2 ended in ${state.phase2ScanDuration} BEFORE scanning ${neverScanned} of ${rows.size()} rules (heartbeat or total-timeout backstop) — they are marked '?'. Run Scan again to fill them in."
+            state.scanStatus = "<i>Phase 2 ended before scanning ${neverScanned} of ${rows.size()} rules (marked <span style='color:#c00;font-weight:bold;'>?</span>). The hub may have been busy — running Scan again may fill them in.</i>"
+        }
         log.info "SAS: Phase 2 complete in ${state.phase2ScanDuration}; total scan time ${state.totalScanDuration} — ${state.specialActionRuleCount ?: 0} of ${rows.size()} rules with detected special actions; ${state.specialActionUnknownCount ?: 0} unknown/skipped"
 
     } catch (Exception e) {
         log.warn "finalizeUsageScan: ${e.message}"
     } finally {
-        configureScanId         = null
-        configureQueue          = null
-        configureResults        = null
-        configureNextIdx        = 0
-        configureInFlight       = 0
-        configureTotalRules     = 0
-        configureInflight       = [:]
         state.scanStartedMs     = null
         state.phase1EndedMs     = null
     }
@@ -1040,6 +1313,7 @@ void finalizeScan() {
                 name: rule.name as String,
                 appType: (rule.appType ?: "RM") as String,
                 lastRun: "",
+                liveKeys: [],
                 specialActions: emptyKeywordCounts(),
                 specialUnknown: true,
                 modes: []]
@@ -1066,19 +1340,39 @@ void finalizeScan() {
 
     if (!asyncRules.isEmpty()) {
         buildModeIdMap()
-        configureScanId     = (currentScanId ?: "scan") + "_cfg"
-        configureQueue      = asyncRules
-        configureResults    = [:]
-        configureInflight   = [:]
-        configureNextIdx    = 0
-        configureInFlight   = 0
-        configureTotalRules = asyncRules.size()
 
-        runIn(CONFIGURE_TOTAL_TIMEOUT_SECS, "finalizeUsageScan")
+        // Live action keys captured from Phase 1 statusJson, used in Phase 2
+        // to separate live keyword matches from stale/leftover ones.
+        Map liveKeyMap = [:]
+        rmRows.each { Map r ->
+            liveKeyMap[r.id as String] = (r.liveKeys instanceof List) ? (List) r.liveKeys : []
+        }
+
+        // Backstop before Phase 2 is force-finalized. Scaled to the worst
+        // case (every rule burning its first-attempt and retry timeouts, at
+        // CONFIGURE_MAX_IN_FLIGHT concurrency) so large/slow hubs are not cut
+        // off mid-scan; the heartbeat still catches genuine stalls quickly.
+        int perRuleWorstSecs = CONFIGURE_REQUEST_TIMEOUT_SECS + CONFIGURE_RETRY_TIMEOUT_SECS + 10
+        int batches          = (int) Math.ceil(asyncRules.size() / (double) CONFIGURE_MAX_IN_FLIGHT)
+        int totalTimeoutSecs = Math.max(CONFIGURE_TOTAL_TIMEOUT_SECS, batches * perRuleWorstSecs)
+
+        synchronized (PHASE2_LOCK) {
+            configureLiveKeys   = liveKeyMap
+            configureScanId     = (currentScanId ?: "scan") + "_cfg"
+            configureQueue      = asyncRules
+            configureResults    = [:]
+            configureInflight   = [:]
+            configureAttempts   = [:]
+            configureNextIdx    = 0
+            configureInFlight   = 0
+            configureTotalRules = asyncRules.size()
+        }
+
+        runIn(totalTimeoutSecs, "finalizeUsageScan")
         resetConfigureHeartbeat("start")
         configurePump()
 
-        log.info "SAS: Phase 2 started — ${asyncRules.size()} configure/json requests queued; max in flight: ${CONFIGURE_MAX_IN_FLIGHT}; heartbeat: ${CONFIGURE_HEARTBEAT_SECS}s"
+        log.info "SAS: Phase 2 started — ${asyncRules.size()} configure/json requests queued; max in flight: ${CONFIGURE_MAX_IN_FLIGHT}; heartbeat: ${CONFIGURE_HEARTBEAT_SECS}s; retries per rule: ${CONFIGURE_MAX_ATTEMPTS - 1}; total-timeout backstop: ${formatScanDuration(totalTimeoutSecs * 1000L)}"
     }
 
     currentScanId      = null
@@ -1262,6 +1556,7 @@ String buildRmPrintHtml() {
         sb << "<th>${htmlEncode(h)}</th>"
     }
     sb << "</tr></thead><tbody>"
+    boolean suppressStale = isSuppressStaleEnabled()
     rows.each { Map r ->
         Map actions = normalizeKeywordMap(r.specialActions instanceof Map ? (Map) r.specialActions : [:])
         boolean unknown = r.specialUnknown == true
@@ -1270,7 +1565,8 @@ String buildRmPrintHtml() {
         sb << "<td>${htmlEncode(r.name)}</td>"
         sb << "<td class='c'>${htmlEncode(r.appType ?: '')}</td>"
         SPECIAL_ACTION_KEYS.each { String key ->
-            String v = unknown ? "?" : (actions[key] == true ? "Yes" : "No")
+            String cellState = keywordCellState(actions[key], suppressStale)
+            String v = unknown ? "?" : (cellState == "live" ? "Yes" : (cellState == "stale" ? "Stale" : "No"))
             sb << "<td class='c'>${v}</td>"
         }
         List<String> modesList = normalizeModesList(r.modes)
@@ -1292,12 +1588,14 @@ String buildRmCsv() {
 
     StringBuilder sb = new StringBuilder()
     sb << (["Rule ID", "Rule", "App Type"] + SPECIAL_ACTION_KEYS.collect { String key -> labelForKeyword(key) } + ["Modes", "Last Run"]).collect { escapeCsv(it) }.join(",") << "\n"
+    boolean suppressStale = isSuppressStaleEnabled()
     rows.each { Map r ->
         Map actions = normalizeKeywordMap(r.specialActions instanceof Map ? (Map) r.specialActions : [:])
         boolean unknown = r.specialUnknown == true
         List vals = [r.id, r.name, r.appType]
         SPECIAL_ACTION_KEYS.each { String key ->
-            vals << (unknown ? "?" : (actions[key] == true ? "Yes" : "No"))
+            String cellState = keywordCellState(actions[key], suppressStale)
+            vals << (unknown ? "?" : (cellState == "live" ? "Yes" : (cellState == "stale" ? "Stale" : "No")))
         }
         vals << (unknown ? "?" : normalizeModesList(r.modes).join(", "))
         vals << r.lastRun
@@ -1561,6 +1859,17 @@ String buildReportHtml(List<Map> rows) {
     sb << "<input id='rmname-filter' type='text' class='rmname-filter' placeholder='Filter rule name (substring or * ? wildcards)' oninput='applyRmRowFilters()' style='width:330px;'>"
     sb << "</div>"
 
+    sb << "<div style='font-size:0.85em;color:#555;margin:2px 0 6px;'>"
+    sb << "<span style='color:green;font-weight:bold;'>&#10003;</span> = active special action &nbsp; "
+    if (isSuppressStaleEnabled()) {
+        sb << "<i>(stale-only matches are currently shown as not found — see Controls)</i> &nbsp; "
+    } else {
+        sb << "<span style='color:#d98800;font-weight:bold;'>&#10003;</span> = found only in stale/leftover entries (deleted actions, clipboard, old settings) &nbsp; "
+    }
+    sb << "<span style='color:#aaa;'>—</span> = not found &nbsp; "
+    sb << "<span style='color:#c00;font-weight:bold;'>?</span> = could not be read"
+    sb << "</div>"
+
     sb << "<table id='rmlog_table' class='rmlogcheck'><thead><tr>"
     sb << "<th onclick=\"sortRmLogTable('rmlog_table',0)\" class='center rmcol-ruleid'>Rule ID</th>"
     sb << "<th onclick=\"sortRmLogTable('rmlog_table',1)\" class='sort-asc'>Rule</th>"
@@ -1585,8 +1894,10 @@ String buildReportHtml(List<Map> rows) {
 
         Map actions = normalizeKeywordMap(r.specialActions instanceof Map ? (Map) r.specialActions : [:])
         boolean unknown = r.specialUnknown == true
-        boolean anySpecial = !unknown && SPECIAL_ACTION_KEYS.any { String key -> actions[key] == true }
-        String specialAny = unknown ? "unknown" : (anySpecial ? "true" : "false")
+        boolean suppressStale = isSuppressStaleEnabled()
+        boolean anySpecial = !unknown && SPECIAL_ACTION_KEYS.any { String key -> keywordCellState(actions[key], suppressStale) == "live" }
+        boolean anyStale   = !unknown && SPECIAL_ACTION_KEYS.any { String key -> keywordCellState(actions[key], suppressStale) == "stale" }
+        String specialAny = unknown ? "unknown" : (anySpecial ? "true" : (anyStale ? "stale" : "false"))
 
         sb << "<tr data-rule-name='${nameSort}' data-special-any='${specialAny}'>"
         sb << "<td class='center rmcol-ruleid' data-sort='${id}'>${id}</td>"
@@ -1594,11 +1905,22 @@ String buildReportHtml(List<Map> rows) {
         sb << "<td class='center rmcol-apptype' data-sort='${appType}'>${appType}</td>"
         SPECIAL_ACTION_KEYS.each { String key ->
             String cls = colClassForKeyword(key)
-            boolean found = actions[key] == true
-            String disp = unknown
-                ? "<span title='configure/json unknown or skipped' style='color:#c00;font-weight:bold;'>?</span>"
-                : (found ? "<span style='color:green;font-weight:bold;'>&#10003;</span>" : "<span style='color:#aaa;'>—</span>")
-            String sortVal = unknown ? "1" : (found ? "2" : "0")
+            String cellState = keywordCellState(actions[key], suppressStale)
+            String disp
+            String sortVal
+            if (unknown) {
+                disp    = "<span title='configure/json unknown or skipped' style='color:#c00;font-weight:bold;'>?</span>"
+                sortVal = "2"
+            } else if (cellState == "live") {
+                disp    = "<span style='color:green;font-weight:bold;'>&#10003;</span>"
+                sortVal = "3"
+            } else if (cellState == "stale") {
+                disp    = "<span title='Found only in stale/leftover entries not referenced by this rule&#39;s current actionList (e.g., deleted actions, clipboard copies, old settings)' style='color:#d98800;font-weight:bold;'>&#10003;</span>"
+                sortVal = "1"
+            } else {
+                disp    = "<span style='color:#aaa;'>—</span>"
+                sortVal = "0"
+            }
             sb << "<td class='center rmcol-special ${cls}' data-sort='${sortVal}'>${disp}</td>"
         }
         List<String> modesList = normalizeModesList(r.modes)
@@ -1639,10 +1961,32 @@ Map emptyKeywordCounts() {
     return m
 }
 
+// Normalize a stored keyword map (which round-trips through state JSON) back
+// to tri-state values: true (live), "stale" (found only in leftover entries),
+// or false (not found).
 Map normalizeKeywordMap(Map raw) {
     Map m = [:]
-    SPECIAL_ACTION_KEYS.each { String key -> m[key] = (raw?.get(key) == true || raw?.get(key)?.toString() == "true") }
+    SPECIAL_ACTION_KEYS.each { String key ->
+        Object v = raw?.get(key)
+        String s = v?.toString()
+        if (v == true || s == "true")   { m[key] = true }
+        else if (s == "stale")          { m[key] = "stale" }
+        else                            { m[key] = false }
+    }
     return m
+}
+
+// Resolve a normalized keyword value to its display state, honoring the
+// "Treat stale-only keyword matches as not found" toggle.
+// Returns "live", "stale", or "none".
+String keywordCellState(Object v, boolean suppressStale) {
+    if (v == true || v?.toString() == "true") return "live"
+    if (v?.toString() == "stale") return suppressStale ? "none" : "stale"
+    return "none"
+}
+
+boolean isSuppressStaleEnabled() {
+    return settings?.suppressStale == true
 }
 
 void updateSpecialActionStats(List<Map> rows) {
@@ -1652,6 +1996,7 @@ void updateSpecialActionStats(List<Map> rows) {
     Integer ruleCount = 0
     Integer unknownCount = 0
     Integer modeRuleCount = 0
+    Integer staleRuleCount = 0
 
     rows.each { Map r ->
         boolean unknown = r.specialUnknown == true
@@ -1660,13 +2005,17 @@ void updateSpecialActionStats(List<Map> rows) {
         } else {
             Map actions = normalizeKeywordMap(r.specialActions instanceof Map ? (Map) r.specialActions : [:])
             boolean any = false
+            boolean anyStale = false
             SPECIAL_ACTION_KEYS.each { String key ->
                 if (actions[key] == true) {
                     counts[key] = (counts[key] ?: 0) + 1
                     any = true
+                } else if (actions[key]?.toString() == "stale") {
+                    anyStale = true
                 }
             }
             if (any) ruleCount++
+            if (anyStale) staleRuleCount++
             if (normalizeModesList(r.modes)) modeRuleCount++
         }
     }
@@ -1675,6 +2024,7 @@ void updateSpecialActionStats(List<Map> rows) {
     state.specialActionUnknownCount = unknownCount
     state.specialActionCountsJson   = groovy.json.JsonOutput.toJson(counts)
     state.modeRuleCount             = modeRuleCount
+    state.staleMatchRuleCount       = staleRuleCount
 }
 
 String labelForKeyword(String key) {
