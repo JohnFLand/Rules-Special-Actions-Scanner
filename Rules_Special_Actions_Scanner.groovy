@@ -85,6 +85,100 @@
  *    page now say so explicitly (how many rules were never reached), instead
  *    of a "Phase 2 complete" message that looked like a normal finish.
  *
+ *  1.10: Adds a fourth keyword state for the mixed case. Previously,
+ *  detection stopped at the first live occurrence of a keyword, so a rule
+ *  with an active While AND leftover While entries from a deleted action
+ *  looked identical to a clean rule — its cruft was invisible and it was
+ *  excluded from the stale-leftover count. Detection now examines all
+ *  occurrences and distinguishes:
+ *      true        -> live only            (green check)
+ *      "livestale" -> live + stale cruft   (green check with orange *)
+ *      "stale"     -> stale cruft only     (orange check)
+ *      false       -> not found            (dash)
+ *  Occurrences without an index suffix still count only toward the live side
+ *  (they cannot be judged) and never mark a rule as carrying cruft. The
+ *  "Rules with stale keyword leftovers" summary count now includes mixed
+ *  rules; per-keyword counts include plain-live and mixed. The suppress
+ *  toggle shows stale-only cells as dashes and mixed cells as plain green.
+ *  CSV/print exports use "Yes+Stale" for the mixed state. Also: a successful
+ *  configure/json retry is now logged explicitly, and the Phase 2 completion
+ *  log line includes the stale-leftover rule count.
+ *
+ *  1.11: Fixes a lingering Phase 2 progress message. The pump wrote its
+ *  "N/M complete, X active" status line outside the lock, so a slow pump
+ *  thread could stamp a stale progress message onto the app page after
+ *  finalize had already cleared it (observed as "24/25 complete, 1 active"
+ *  persisting in state after a successful 25-rule scan). The status write
+ *  now happens inside the lock and only while the scan is still live, and
+ *  finalize clears scanStatus after taking ownership of the scan rather
+ *  than before. Field validation note: a real-hub scan confirmed Phase 1
+ *  liveKeys extraction works for both RM and BC rules, and that actionList
+ *  keys are plain integers — so the liberal prefix matching in
+ *  isActionKeyLive cannot mistakenly classify leftover entries as live.
+ *
+ *  1.12: Reworks keyword detection around ground truth from a real rule's
+ *  status page. RM does NOT append the action index to the keyword
+ *  (the 1.08 assumption); the keyword is a bare setting VALUE and the index
+ *  is a dot-suffix on the setting NAME: actType.6 = "repeatActs",
+ *  actSubType.3 = "getWaitRule". Under the old suffix-regex, every
+ *  occurrence therefore read as "bare" and classified live — right answers
+ *  on clean rules, but structurally blind to a genuine settings ghost like
+ *  a leftover actType.4. Detection is now a structured walk of the parsed
+ *  configure/json (mirroring the modes walk) that attributes each keyword
+ *  VALUE to its NAME's trailing index and classifies by actionList
+ *  membership. Three shapes are recognized: {name, value} settings entries,
+ *  map-keyed settings, and the legacy name-embedded form ("getWhile3").
+ *  Additionally, Phase 1 now mines statusJson state directly: the "actions"
+ *  HashMap (each entry's "method" field, keyed by action key) is compared
+ *  against actionList — the literal definition of rule cruft — and tokens
+ *  found in clipboard buffers / old-settings snapshots (clipList, cutAction,
+ *  copyL, varSettingsOld) count as stale by definition. Phase 1 and Phase 2
+ *  hits are merged per keyword into the same four-state model. A token map
+ *  folds RM's dual vocabulary (actType "repeatActs" vs actSubType/method
+ *  "getRepeat") onto one column. Tokens that cannot be attributed by any
+ *  recognized shape fall back to raw-text matching and count as live —
+ *  unexpected payload formats still degrade to the pre-1.08 behavior, never
+ *  to false negatives.
+ *
+ *  1.13: Adds "clip" to the stale-by-definition state entries. Field
+ *  validation of 1.12 (a Cut Repeat action) confirmed correct stale
+ *  classification via orphaned actType/actSubType settings and the orphaned
+ *  actions-map entry, and revealed that this RM version stores the clipboard
+ *  in state under "clip" — a name not previously guarded. A clipboard entry
+ *  is now detected as stale even on an RM version that fully cleans the
+ *  settings and actions map on Cut.
+ *
+ *  1.14: Truly fixes the lingering "Phase 2: checking… N/M complete" line.
+ *  The 1.11 lock-ordering fix was insufficient because the root cause is a
+ *  Hubitat platform behavior: app state is loaded when an execution starts
+ *  and committed when it exits, last-writer-wins per changed key. A pump
+ *  execution that legitimately wrote a progress message while the scan was
+ *  live could finish — and commit — moments after finalize's execution
+ *  committed its clear, resurrecting the stale message. No in-method
+ *  ordering or locking can prevent a commit-time overwrite, and the symptom
+ *  is intermittent (observed on a 1.12 scan, absent on an otherwise
+ *  identical 1.13 scan). The progress line now lives in a @Field static
+ *  (scanStatusLine), which IS shared live across concurrent executions, so
+ *  the PHASE2_LOCK ordering genuinely holds; the legacy state.scanStatus key
+ *  is removed on upgrade. The partial-completion notice ("Phase 2 ended
+ *  before scanning N rules") moves to its own state.scanNotice key, written
+ *  only by finalize — single writer, so it persists safely across reboots.
+ *
+ *  1.15: Marker legibility. The mixed live+stale cell is now a plain blue
+ *  checkmark (the green-check-with-orange-asterisk was hard to read on
+ *  high-resolution screens), and the stale-only checkmark changes from
+ *  orange to red. Tooltips, the legend, Notes, and the Controls toggle text
+ *  are updated to match; sort order, CSV/print values ("Yes+Stale",
+ *  "Stale"), and detection logic are unchanged.
+ *
+ *  1.16: The mixed live+stale marker becomes a double checkmark — one green
+ *  (the live action) immediately followed by one red (the cruft) — replacing
+ *  1.15's blue checkmark, which proved to be a poor indicator color on some
+ *  screens. The pair is wrapped in white-space:nowrap so it cannot split
+ *  across lines in a narrow column. Legend, tooltips, Notes, and the
+ *  Controls toggle text updated; sort order, CSV/print values, and detection
+ *  logic unchanged.
+ *
  *  Notes:
  *  - Uses Hubitat local/internal JSON endpoints:
  *      /hub2/appsList
@@ -128,6 +222,34 @@ import groovy.transform.CompileStatic
     getWaitEvents: "Wait for Event"
 ]
 
+// RM stores special actions with more than one vocabulary: the actType.N
+// setting for a Repeat holds "repeatActs" while its actSubType.N setting and
+// the state actions-map "method" field hold "getRepeat". This map folds every
+// known token onto the scanner's canonical column key.
+@Field static final Map<String, String> KEYWORD_TOKEN_MAP = [
+    getWhile     : "getWhile",
+    repeatActs   : "repeatActs",
+    getRepeat    : "repeatActs",
+    getEndRepeat : "getEndRepeat",
+    getStopRepeat: "getStopRepeat",
+    getWaitRule  : "getWaitRule",
+    getWaitEvents: "getWaitEvents"
+]
+
+// State variables whose contents are stale by definition: clipboard buffers
+// (Cut/Copy actions) and old variable-settings snapshots. Any special-action
+// token found inside these counts as a stale occurrence for its column.
+// "clip" observed in the field (RM 5.1 era) holding a Cut action's full
+// definition; the others cover older/alternate RM versions.
+@Field static final List<String> STALE_STATE_ENTRY_NAMES = [
+    "clip", "clipList", "cutAction", "copyL", "varSettingsOld"
+]
+
+// Trailing action-key index on a setting name, e.g. the "6" in "actType.6"
+// or a nested "2.1" in "foo.2.1".
+@Field static final java.util.regex.Pattern SETTING_NAME_INDEX_PATTERN =
+    java.util.regex.Pattern.compile(/.*?\.(\d+(?:\.\d+)*)$/)
+
 // Transient scan state lives in @Field static to avoid database writes during a scan.
 // If the app class is reloaded during a scan (e.g., on code save or hub restart),
 // the scan is abandoned and can be run again.
@@ -144,6 +266,15 @@ import groovy.transform.CompileStatic
 @Field static Map       configureInflight       = [:]    // ruleId -> [startedMs, name], for dropped-response watchdog
 @Field static Map       modeIdToName            = null   // hub mode ID -> mode name, built at Phase 2 start
 @Field static Map       configureLiveKeys       = [:]    // ruleId -> List<String> live action keys captured from Phase 1 statusJson
+@Field static Map       configurePhase1Hits     = [:]    // ruleId -> Map<column, "live"|"stale"|"livestale"> keyword hits from Phase 1 state (actions map, clipboard buffers)
+// Transient scan-progress line shown on the app page. Deliberately a static,
+// NOT state: Hubitat loads state when an app execution starts and commits it
+// when the execution exits (last-writer-wins per changed key), so a pump
+// execution that finishes just after finalize would resurrect a stale
+// progress message no matter how the writes are ordered in-method. Statics
+// are shared live across concurrent executions, so ordering under
+// PHASE2_LOCK actually holds.
+@Field static String    scanStatusLine          = null
 @Field static Map       configureAttempts       = [:]    // ruleId -> number of configure/json attempts launched
 @Field static final Object PHASE2_LOCK          = new Object()  // guards all Phase 2 shared state above (pump, callbacks, heartbeat, finalize can run on different threads)
 
@@ -153,7 +284,7 @@ import groovy.transform.CompileStatic
 @Field static final java.util.regex.Pattern MODE_SETTING_NAME_PATTERN = ~/^modes?[XY]?\d*(\.\d+)?$/
 
 definition(
-    name:           "Rules Special Actions Scanner 1.09",
+    name:           "Rules Special Actions Scanner 1.16",
     namespace:      "John Land",
     author:         "John Land & AI",
     description:    "Scans RM/BC rules and reports selected special-action keywords found in rule configuration JSON.",
@@ -197,9 +328,10 @@ void updated() {
     syncAppInstanceLabel()
 
     boolean scanWasActive = (currentScanId != null || configureScanId != null)
+    state.remove("scanStatus")   // legacy key from <=1.13; superseded by the scanStatusLine static
     initialize()
     if (scanWasActive) {
-        state.scanStatus = "<i>Scan was cancelled because app settings were saved. Click Scan again to run again.</i>"
+        scanStatusLine = "<i>Scan was cancelled because app settings were saved. Click Scan again to run again.</i>"
     } else {
         reRenderReportIfCached()
     }
@@ -268,7 +400,9 @@ void initialize() {
         configureInflight       = [:]
         modeIdToName            = null
         configureLiveKeys       = [:]
+        configurePhase1Hits     = [:]
         configureAttempts       = [:]
+        scanStatusLine          = null
     }
 
     unsubscribe()
@@ -412,8 +546,11 @@ def mainPage() {
             } else {
                 paragraph "No scan has been run yet."
             }
-            if (state.scanStatus) {
-                paragraph state.scanStatus
+            if (scanStatusLine) {
+                paragraph scanStatusLine
+            }
+            if (state.scanNotice) {
+                paragraph state.scanNotice
             }
             if (state.lastError) {
                 paragraph "<span style='color:red'><b>Last error:</b> ${htmlEncode(state.lastError.toString())}</span>"
@@ -465,7 +602,9 @@ def mainPage() {
                 submitOnChange: true
             paragraph "<small>Keyword matches found only in stale/leftover rule entries (deleted actions, " +
                       "clipboard copies, old settings — anything no longer referenced by the rule's actionList) " +
-                      "are normally shown as an orange checkmark. Turn this on to show them as a dash instead. " +
+                      "are normally shown as a red checkmark, and mixed live+stale matches as a green " +
+                      "and red checkmark pair. Turn this on to show stale-only cells as a " +
+                      "dash and mixed cells as a plain green checkmark. " +
                       "Takes effect immediately from cached scan data; no re-scan needed.</small>"
 
             input "debugEnable", "bool",
@@ -497,21 +636,26 @@ def mainPage() {
                 does end early, the app page and log state how many rules were never reached.
                 <br><br>
                 <b>Live vs. stale matches</b><br>
-                Rule Machine never garbage-collects deleted actions: their settings, clipboard
-                entries (<code>clipList</code>), and old variable settings
-                (<code>varSettingsOld</code>) can remain in a rule's stored configuration
-                indefinitely. Each keyword occurrence carries an action index (e.g. the
-                <code>2.1</code> in <code>repeatActs2.1</code>); if none of a keyword's
-                occurrences maps to a live action key from the rule's <code>actionList</code>,
-                the match is classified as <b>stale</b> and shown as an
-                <span style='color:#d98800;font-weight:bold;'>orange checkmark</span> — leftover
-                cruft, useful when hunting rules that need cleanup. The <b>Treat stale-only
-                keyword matches as not found</b> toggle in Controls shows them as dashes instead.
-                If a rule's live action-key list could not be read (or is empty), classification
-                falls back to the pre-1.08 behavior and every keyword hit is shown as live, so
-                unreadable rules never produce false negatives. The action-key formats are a
-                best-guess match against current Rule Machine internals and are not a formal
-                public API.
+                Rule Machine stores each action's type as a bare keyword in a setting whose
+                name carries the action's index (e.g. <code>actType.6 = repeatActs</code>), and
+                mirrors it in the state <code>actions</code> map's <code>method</code> field.
+                RM does not always garbage-collect deleted actions, and clipboard buffers
+                (Cut/Copy) plus old variable-settings snapshots persist indefinitely. The scan
+                attributes every keyword occurrence to its action index and checks that index
+                against the rule's <code>actionList</code>; occurrences in clipboard buffers
+                count as stale by definition. A keyword found only in such leftovers is shown
+                as a <span style='color:#c00;font-weight:bold;'>red checkmark</span> —
+                cruft, useful when hunting rules that need cleanup. A rule can also have both:
+                an active special action <i>and</i> stale leftovers for the same keyword. That
+                mixed case is shown as a pair of checkmarks,
+                <span style='font-weight:bold;white-space:nowrap;'><span style='color:green;'>&#10003;</span><span style='color:#c00;'>&#10003;</span></span>
+                (one green for the live action, one red for the cruft) — the
+                action is real, but there is also cruft to clean. The <b>Treat stale-only
+                keyword matches as not found</b> toggle in Controls shows stale-only cells as
+                dashes and mixed cells as plain green checkmarks.
+                Occurrences that cannot be attributed to any action index are shown as live,
+                and if a rule's live action-key list could not be read, every keyword hit in
+                that rule is shown as live — unreadable data never produces false negatives.
                 <br><br>
                 <b>Modes column</b><br>
                 During Phase 2 the configuration JSON is also parsed and searched for mode
@@ -529,10 +673,11 @@ def mainPage() {
                 <b>Table</b><br>
                 Shows Rule ID, Rule name (linked to its config page), App Type, one column for
                 each keyword, Modes, and Last Run. Keyword cells show a green checkmark when the
-                keyword is found in a live action, an orange checkmark when it is found only in
-                stale/leftover entries, a dash when it is not found, or a red question mark when
-                the rule's configuration JSON could not be read. Summary keyword counts include
-                live matches only; stale-only rules are counted separately.
+                keyword is found in live actions only, a green+red checkmark pair when it is
+                found in a live action AND in stale/leftover entries, a red checkmark when it is found only
+                in stale/leftover entries, a dash when it is not found, or a red question mark
+                when the rule's configuration JSON could not be read. Summary keyword counts include live matches (plain and mixed); the
+                stale-leftover rule count includes both stale-only and mixed rules.
                 <br><br>
                 The <b>Hide rows with no Special Actions</b> button hides rows where all six
                 keyword columns are known and none is present. Unknown/skipped rows and rows with
@@ -561,7 +706,7 @@ String buildSummaryHtml() {
     sb << "<b>Rules scanned:</b> ${state.scannedCount ?: 0}; "
     sb << "<b>Rules with Special Actions:</b> ${state.specialActionRuleCount ?: 0}; "
     sb << "<b>Rules with stale keyword leftovers:</b> ${state.staleMatchRuleCount ?: 0}"
-    if (isSuppressStaleEnabled()) sb << " <i>(shown as not found)</i>"
+    if (isSuppressStaleEnabled()) sb << " <i>(stale markers hidden)</i>"
     sb << "; <b>Unknown/skipped:</b> ${state.specialActionUnknownCount ?: 0}"
     SPECIAL_ACTION_KEYS.each { String key ->
         sb << "; <b>${htmlEncode(labelForKeyword(key))}:</b> ${counts[key] ?: 0}"
@@ -611,7 +756,9 @@ void scanRules() {
     state.totalScanDuration         = null
     state.scanDuration              = null
 
-    state.scanStatus                = "<i>Scan in progress…</i>"
+    scanStatusLine                  = "<i>Scan in progress…</i>"
+    state.scanNotice                = null
+    state.remove("scanStatus")   // legacy key from <=1.13; no longer used
     state.reportHtml                = null
     state.scanRowsJson              = null
 
@@ -635,7 +782,7 @@ void scanRules() {
         state.totalScanDuration         = "00:00"
         state.scanDuration              = "00:00"
         state.reportHtml                = "<p>No Rule Machine or Button Controller rules found.</p>"
-        state.scanStatus                = null
+        scanStatusLine                  = null
         return
     }
 
@@ -650,7 +797,7 @@ void scanRules() {
          appType  : (r.appType ?: "RM")  as String]
     }
 
-    state.scanStatus = "<i>Scan started: ${scanStartTime} — scanning ${queue.size()} rules…</i>"
+    scanStatusLine = "<i>Scan started: ${scanStartTime} — scanning ${queue.size()} rules…</i>"
 
     scanRuleQueue      = queue
     scanPartialResults = [:]
@@ -697,10 +844,11 @@ void handleStatusResponse(resp, data) {
 
         if (scanPartialResults == null) scanPartialResults = [:]
 
-        List<String> liveKeys = extractLiveActionKeys(status)
+        List<String> liveKeys  = extractLiveActionKeys(status)
+        Map          stateHits = extractStateKeywordHits(status, liveKeys as Set)
 
         if (debugEnable) {
-            log.debug "Scanned status: ${data.ruleName} (${ruleId}, ${data.appType}) LastRun=${extractLastRun(status)}, liveActionKeys=${liveKeys}"
+            log.debug "Scanned status: ${data.ruleName} (${ruleId}, ${data.appType}) LastRun=${extractLastRun(status)}, liveActionKeys=${liveKeys}, stateKeywordHits=${stateHits}"
         }
 
         scanPartialResults[ruleId] = [
@@ -709,6 +857,7 @@ void handleStatusResponse(resp, data) {
             appType        : data.appType,
             lastRun        : extractLastRun(status),
             liveKeys       : liveKeys,
+            stateHits      : stateHits,
             specialActions : emptyKeywordCounts(),
             specialUnknown : true,
             modes          : []
@@ -723,6 +872,7 @@ void handleStatusResponse(resp, data) {
             appType        : (data.appType ?: "RM") as String,
             lastRun        : "",
             liveKeys       : [],
+            stateHits      : [:],
             specialActions : emptyKeywordCounts(),
             specialUnknown : true,
             modes          : []
@@ -873,10 +1023,15 @@ void configurePump() {
         done   = (configureResults?.size() ?: 0) as Integer
         total  = (configureTotalRules ?: 0) as Integer
         active = (configureInFlight ?: 0) as Integer
-    }
 
-    if (total > 0) {
-        state.scanStatus = "<i>Phase 2: checking configure/json for special-action keywords… ${done}/${total} complete, ${active} active</i>"
+        // Write the progress line while still holding the lock, and only if
+        // the scan is still live. Because scanStatusLine is a static (shared
+        // live across executions), the lock ordering with finalize genuinely
+        // holds — unlike state, whose per-execution commit could resurrect a
+        // stale message.
+        if (configureScanId != null && total > 0 && done < total) {
+            scanStatusLine = "<i>Phase 2: checking configure/json for special-action keywords… ${done}/${total} complete, ${active} active</i>"
+        }
     }
 
     // The scan is not stalled while bounded requests are still in flight —
@@ -910,7 +1065,8 @@ void handleConfigureResponse(resp, data) {
         if (httpStatus == 200) {
             Object raw = resp.getData()
             Set<String>  liveKeys  = liveKeysForRule(ruleId)
-            Map          foundMap  = detectSpecialActionsFromRaw(raw, liveKeys)
+            Map          p1Hits    = phase1HitsForRule(ruleId)
+            Map          foundMap  = detectSpecialActionsFromRaw(raw, liveKeys, p1Hits)
             List<String> modesList = detectModesFromRaw(raw)
             if (foundMap != null) {
                 resultMap = [keywords: foundMap, modes: (modesList ?: [])]
@@ -952,6 +1108,10 @@ void handleConfigureResponse(resp, data) {
 
         if (resultMap != null) {
             configureResults[ruleId] = resultMap
+            int attemptsUsed = (configureAttempts?.get(ruleId) ?: 1) as int
+            if (attemptsUsed > 1) {
+                log.info "SAS: configure/json retry succeeded for rule ${ruleId} (${ruleName}) on attempt ${attemptsUsed}"
+            }
         } else {
             requeueOrMarkUnknown(ruleId, ruleName, failReason ?: "unknown failure")
         }
@@ -985,6 +1145,95 @@ private List<String> extractLiveActionKeys(Map status) {
         log.warn "extractLiveActionKeys: ${e.message}"
     }
     return keys as List
+}
+
+// Fold a live/stale occurrence pair into a hit-state string.
+private String hitStateFor(boolean live, boolean stale) {
+    if (live && stale) return "livestale"
+    if (live)          return "live"
+    if (stale)         return "stale"
+    return null
+}
+
+// Scan a rule's statusJson Application State for special-action keyword hits.
+// Two sources:
+//  1. The "actions" HashMap — RM's per-action metadata, keyed by action key,
+//     each entry carrying a "method" field (e.g. "getRepeat"). Keys present
+//     in actionList are live; keys absent from it are the classic cruft your
+//     status page shows for deleted actions.
+//  2. Clipboard buffers and old-settings snapshots (clipList, cutAction,
+//     copyL, varSettingsOld) — any keyword token in these is stale by
+//     definition.
+// Returns Map<column, "live"|"stale"|"livestale">, empty when nothing found
+// or no live-key info is available (in which case Phase 2's conservative
+// fallback governs on its own).
+private Map extractStateKeywordHits(Map status, Set<String> liveKeys) {
+    Map hits = [:]
+    try {
+        if (liveKeys == null || liveKeys.isEmpty()) return hits
+
+        Map liveByCol  = [:]
+        Map staleByCol = [:]
+
+        status?.appState?.each { item ->
+            String n = item?.name?.toString() ?: ""
+            Object v = item?.value
+
+            if (n == "actions") {
+                Map actionsMap = null
+                if (v instanceof Map) {
+                    actionsMap = (Map) v
+                } else if (v != null) {
+                    try {
+                        Object parsed = new groovy.json.JsonSlurper().parseText(v.toString())
+                        if (parsed instanceof Map) actionsMap = (Map) parsed
+                    } catch (Exception ignored) { /* fall through to token scan below */ }
+                }
+                if (actionsMap != null) {
+                    actionsMap.each { Object k, Object entry ->
+                        String actionKey = k?.toString() ?: ""
+                        String method = (entry instanceof Map) ? ((Map) entry).get("method")?.toString() : null
+                        String col = method ? KEYWORD_TOKEN_MAP[method] : null
+                        if (col && actionKey) {
+                            if (isActionKeyLive(actionKey, liveKeys)) liveByCol[col] = true
+                            else                                      staleByCol[col] = true
+                        }
+                    }
+                } else if (v != null) {
+                    // Unparseable actions blob: find tokens but attribute
+                    // conservatively as live (cannot pair token with key).
+                    String txt = v.toString()
+                    KEYWORD_TOKEN_MAP.each { String token, String col ->
+                        if (txt.contains(token)) liveByCol[col] = true
+                    }
+                }
+            } else if (STALE_STATE_ENTRY_NAMES.contains(n) && v != null) {
+                String txt = v.toString()
+                KEYWORD_TOKEN_MAP.each { String token, String col ->
+                    if (txt.contains(token)) staleByCol[col] = true
+                }
+            }
+        }
+
+        SPECIAL_ACTION_KEYS.each { String col ->
+            String s = hitStateFor(liveByCol[col] == true, staleByCol[col] == true)
+            if (s) hits[col] = s
+        }
+    } catch (Exception e) {
+        log.warn "extractStateKeywordHits: ${e.message}"
+    }
+    return hits
+}
+
+// Fetch the Phase 1 state-side keyword hits for a rule (empty map if none).
+private Map phase1HitsForRule(String ruleId) {
+    try {
+        Object h = configurePhase1Hits?.get(ruleId)
+        if (h instanceof Map) return (Map) h
+    } catch (Exception e) {
+        log.warn "phase1HitsForRule ${ruleId}: ${e.message}"
+    }
+    return [:]
 }
 
 // Fetch the Phase 1 live action keys for a rule as a Set (null if none stored).
@@ -1021,51 +1270,165 @@ private boolean isActionKeyLive(String suffix, Set<String> liveKeys) {
     return liveKeys.any { Object k -> k?.toString()?.startsWith(pfx) }
 }
 
-// Classify each special-action keyword in the configure/json payload as:
-//   true    - at least one occurrence refers to a live action
-//   "stale" - occurrences exist, but none refers to a live action (leftover
-//             settings from deleted actions, clipList clipboard copies,
-//             varSettingsOld, etc.)
-//   false   - keyword not present at all
-// When no live action-key set is available for the rule (unreadable
-// statusJson, no actionList state variable, or an empty list — which could
-// also mean this platform version stores it differently), classification
-// falls back to the pre-1.08 behavior and reports every occurrence as live.
-private Map detectSpecialActionsFromRaw(Object raw, Set<String> liveKeys) {
+// Recursively walk parsed configure/json collecting special-action keyword
+// occurrences. RM stores the keyword as a bare setting VALUE and carries the
+// action key as a dot-suffix on the setting NAME (e.g. actType.6 =
+// "repeatActs", actSubType.3 = "getWaitRule") — the keyword itself has no
+// index appended. Two shapes are handled, mirroring collectModeSettings:
+// entries of the form {name:..., value:...} and plain map key -> value pairs.
+// Occurrences are recorded per column as live or stale according to whether
+// the name's index is in the rule's live action-key set; occurrences whose
+// name carries no index cannot be judged and count as live.
+private void collectKeywordHits(Object node, Set<String> liveKeys, Map liveByCol, Map staleByCol, int depth) {
+    if (depth > 50) return
+
+    if (node instanceof Map) {
+        Map m = (Map) node
+
+        // Shape 1: a settings entry {name: "actType.6", type: "enum",
+        // value: "repeatActs"} — attribute the value to the name.
+        String settingName = m.get("name")?.toString() ?: ""
+        if (settingName && m.containsKey("value")) {
+            recordKeywordOccurrences(settingName, m.get("value"), liveKeys, liveByCol, staleByCol)
+        }
+        if (settingName) {
+            recordNameEmbeddedKeyword(settingName, liveKeys, liveByCol, staleByCol)
+        }
+
+        // Shape 2: plain map-keyed settings {"actType.6": "repeatActs"}.
+        // Only keys that carry a dot-index are examined here: attributing a
+        // structural key like "value" or "method" (which has no index) would
+        // register a bare occurrence and wrongly classify ghosts as live.
+        // Index-less settings are still covered by the raw-text fallback.
+        m.each { Object k, Object v ->
+            String key = k?.toString() ?: ""
+            if (key && key != "name" && key != "type" && key != "value") {
+                if (SETTING_NAME_INDEX_PATTERN.matcher(key).matches()) {
+                    recordKeywordOccurrences(key, v, liveKeys, liveByCol, staleByCol)
+                }
+                recordNameEmbeddedKeyword(key, liveKeys, liveByCol, staleByCol)
+            }
+        }
+
+        m.values().each { Object child -> collectKeywordHits(child, liveKeys, liveByCol, staleByCol, depth + 1) }
+    } else if (node instanceof List) {
+        ((List) node).each { Object child -> collectKeywordHits(child, liveKeys, liveByCol, staleByCol, depth + 1) }
+    }
+}
+
+// Shape 3: legacy/name-embedded form where the setting name is the token
+// with the index appended directly (e.g. "getWhile3" or "repeatActs2.1").
+// Anchored exactly to token+digits so ordinary names cannot match.
+private void recordNameEmbeddedKeyword(String name, Set<String> liveKeys, Map liveByCol, Map staleByCol) {
+    if (!name) return
+    KEYWORD_TOKEN_MAP.each { String token, String col ->
+        if (!name.startsWith(token)) return
+        String rest = name.substring(token.length())
+        if (rest && rest ==~ /\d+(?:\.\d+)*/) {
+            if (isActionKeyLive(rest, liveKeys)) liveByCol[col] = true
+            else                                 staleByCol[col] = true
+        }
+    }
+}
+
+// Examine one name/value pair for keyword tokens and classify each hit by
+// the trailing index of the name (actType.6 -> "6"). Values may be a single
+// token, or occasionally list-like; a simple contains() per token suffices
+// because the tokens are distinctive camelCase identifiers.
+private void recordKeywordOccurrences(String name, Object value, Set<String> liveKeys, Map liveByCol, Map staleByCol) {
+    if (value == null) return
+    String valText
+    if (value instanceof CharSequence) {
+        valText = value.toString()
+    } else if (value instanceof List) {
+        // Multi-select values arrive as lists of tokens; scalar elements are
+        // joined so they can be attributed to this name's index. Nested
+        // containers are covered by the recursive walk.
+        valText = ((List) value).findAll { !(it instanceof Map) && !(it instanceof List) }
+                                .collect { it?.toString() ?: "" }.join(",")
+    } else if (value instanceof Map) {
+        valText = null   // containers are walked separately
+    } else {
+        valText = value.toString()
+    }
+    if (!valText) return
+
+    KEYWORD_TOKEN_MAP.each { String token, String col ->
+        if (!valText.contains(token)) return
+        java.util.regex.Matcher nm = SETTING_NAME_INDEX_PATTERN.matcher(name)
+        if (nm.matches()) {
+            String idx = nm.group(1)
+            if (isActionKeyLive(idx, liveKeys)) liveByCol[col] = true
+            else                                staleByCol[col] = true
+        } else {
+            liveByCol[col] = true      // no index on the name: cannot judge
+        }
+    }
+}
+
+// Classify each special-action keyword using the configure/json payload
+// merged with Phase 1 state-side hits (actions map, clipboard buffers):
+//   true        - live occurrences only
+//   "livestale" - live occurrences plus stale leftovers
+//   "stale"     - stale leftovers only
+//   false       - keyword not present at all
+// When no live action-key set is available for the rule, classification
+// falls back to the pre-1.08 behavior: any token anywhere counts as live.
+// A raw-text fallback also covers payload shapes the structured walk does
+// not recognize, so unexpected formats degrade to live rather than to
+// false negatives.
+private Map detectSpecialActionsFromRaw(Object raw, Set<String> liveKeys, Map phase1Hits) {
     try {
         if (raw == null) return null
 
         String jsonText
+        Object parsed = null
         if (raw instanceof CharSequence) {
             jsonText = raw.toString()
+            try { parsed = new groovy.json.JsonSlurper().parseText(jsonText) } catch (Exception ignored) { }
         } else {
             jsonText = groovy.json.JsonOutput.toJson(raw)
+            parsed = raw
         }
 
         boolean haveLiveInfo = (liveKeys != null && !liveKeys.isEmpty())
 
-        Map found = [:]
-        SPECIAL_ACTION_KEYS.each { String key ->
-            if (!jsonText.contains(key)) {
-                found[key] = false
-                return
+        Map liveByCol  = [:]
+        Map staleByCol = [:]
+
+        if (haveLiveInfo && parsed != null) {
+            collectKeywordHits(parsed, liveKeys, liveByCol, staleByCol, 0)
+        }
+
+        // Merge Phase 1 state-side hits (actions map vs actionList, plus
+        // clipboard buffers and old-settings snapshots).
+        if (haveLiveInfo && phase1Hits instanceof Map) {
+            phase1Hits.each { Object k, Object v ->
+                String col = k?.toString()
+                String s   = v?.toString()
+                if (!SPECIAL_ACTION_KEYS.contains(col)) return
+                if (s == "live"      || s == "livestale") liveByCol[col]  = true
+                if (s == "stale"     || s == "livestale") staleByCol[col] = true
             }
-            if (!haveLiveInfo) {
-                found[key] = true
-                return
+        }
+
+        Map found = [:]
+        SPECIAL_ACTION_KEYS.each { String col ->
+            boolean anyLive  = liveByCol[col]  == true
+            boolean anyStale = staleByCol[col] == true
+
+            // Raw-text fallback: token present somewhere, but neither the
+            // structured walk nor Phase 1 attributed it (or no live-key info
+            // exists at all). Count it as live — conservative, and identical
+            // to the pre-1.08 behavior for unrecognized payload shapes.
+            if (!anyLive && !anyStale) {
+                boolean rawHit = KEYWORD_TOKEN_MAP.any { String token, String c -> c == col && jsonText.contains(token) }
+                if (rawHit) anyLive = true
             }
 
-            boolean anyLive = false
-            java.util.regex.Matcher m = java.util.regex.Pattern
-                .compile(java.util.regex.Pattern.quote(key) + /(\d+(?:\.\d+)*)?/)
-                .matcher(jsonText)
-            while (m.find()) {
-                if (isActionKeyLive(m.group(1), liveKeys)) {
-                    anyLive = true
-                    break
-                }
-            }
-            found[key] = anyLive ? true : "stale"
+            if (anyLive)       { found[col] = anyStale ? "livestale" : true }
+            else if (anyStale) { found[col] = "stale" }
+            else               { found[col] = false }
         }
         return found
     } catch (Exception e) {
@@ -1223,15 +1586,16 @@ void finalizeUsageScan() {
     unschedule("configurePump")
     unschedule("configureHeartbeat")
 
-    state.scanStatus = null
-
     Map     cfgRes     = null
     Integer totalRules = 0
 
     // Take ownership of the scan under the lock: null the scan ID first so
     // any late callbacks, pumps, or a second concurrent finalize (heartbeat
     // vs. total-timeout vs. normal completion) bail out cleanly, then
-    // snapshot and clear the shared state.
+    // snapshot and clear the shared state. scanStatus is cleared inside the
+    // lock, after ownership is taken — clearing it any earlier lets a pump
+    // thread that is still mid-cycle re-stamp a stale progress message that
+    // would then linger on the app page until the next scan.
     synchronized (PHASE2_LOCK) {
         if (configureScanId == null) return
         configureScanId = null
@@ -1246,6 +1610,9 @@ void finalizeUsageScan() {
         configureInflight       = [:]
         configureAttempts       = [:]
         configureLiveKeys       = [:]
+        configurePhase1Hits     = [:]
+
+        scanStatusLine          = null
     }
 
     log.info "SAS: Phase 2 finalizing"
@@ -1287,9 +1654,9 @@ void finalizeUsageScan() {
 
         if (neverScanned > 0) {
             log.warn "SAS: Phase 2 ended in ${state.phase2ScanDuration} BEFORE scanning ${neverScanned} of ${rows.size()} rules (heartbeat or total-timeout backstop) — they are marked '?'. Run Scan again to fill them in."
-            state.scanStatus = "<i>Phase 2 ended before scanning ${neverScanned} of ${rows.size()} rules (marked <span style='color:#c00;font-weight:bold;'>?</span>). The hub may have been busy — running Scan again may fill them in.</i>"
+            state.scanNotice = "<i>Phase 2 ended before scanning ${neverScanned} of ${rows.size()} rules (marked <span style='color:#c00;font-weight:bold;'>?</span>). The hub may have been busy — running Scan again may fill them in.</i>"
         }
-        log.info "SAS: Phase 2 complete in ${state.phase2ScanDuration}; total scan time ${state.totalScanDuration} — ${state.specialActionRuleCount ?: 0} of ${rows.size()} rules with detected special actions; ${state.specialActionUnknownCount ?: 0} unknown/skipped"
+        log.info "SAS: Phase 2 complete in ${state.phase2ScanDuration}; total scan time ${state.totalScanDuration} — ${state.specialActionRuleCount ?: 0} of ${rows.size()} rules with detected special actions; ${state.staleMatchRuleCount ?: 0} with stale keyword leftovers; ${state.specialActionUnknownCount ?: 0} unknown/skipped"
 
     } catch (Exception e) {
         log.warn "finalizeUsageScan: ${e.message}"
@@ -1314,6 +1681,7 @@ void finalizeScan() {
                 appType: (rule.appType ?: "RM") as String,
                 lastRun: "",
                 liveKeys: [],
+                stateHits: [:],
                 specialActions: emptyKeywordCounts(),
                 specialUnknown: true,
                 modes: []]
@@ -1336,16 +1704,20 @@ void finalizeScan() {
 
     updateSpecialActionStats(rmRows)
     state.reportHtml = buildReportHtml(rmRows)
-    state.scanStatus = "<i>Phase 2: checking configure/json for special-action keywords…</i>"
+    scanStatusLine = "<i>Phase 2: checking configure/json for special-action keywords…</i>"
 
     if (!asyncRules.isEmpty()) {
         buildModeIdMap()
 
-        // Live action keys captured from Phase 1 statusJson, used in Phase 2
-        // to separate live keyword matches from stale/leftover ones.
+        // Live action keys and state-side keyword hits captured from Phase 1
+        // statusJson, used in Phase 2 to separate live keyword matches from
+        // stale/leftover ones.
         Map liveKeyMap = [:]
+        Map p1HitsMap  = [:]
         rmRows.each { Map r ->
-            liveKeyMap[r.id as String] = (r.liveKeys instanceof List) ? (List) r.liveKeys : []
+            String rid = r.id as String
+            liveKeyMap[rid] = (r.liveKeys  instanceof List) ? (List) r.liveKeys  : []
+            p1HitsMap[rid]  = (r.stateHits instanceof Map)  ? (Map)  r.stateHits : [:]
         }
 
         // Backstop before Phase 2 is force-finalized. Scaled to the worst
@@ -1358,6 +1730,7 @@ void finalizeScan() {
 
         synchronized (PHASE2_LOCK) {
             configureLiveKeys   = liveKeyMap
+            configurePhase1Hits = p1HitsMap
             configureScanId     = (currentScanId ?: "scan") + "_cfg"
             configureQueue      = asyncRules
             configureResults    = [:]
@@ -1566,7 +1939,10 @@ String buildRmPrintHtml() {
         sb << "<td class='c'>${htmlEncode(r.appType ?: '')}</td>"
         SPECIAL_ACTION_KEYS.each { String key ->
             String cellState = keywordCellState(actions[key], suppressStale)
-            String v = unknown ? "?" : (cellState == "live" ? "Yes" : (cellState == "stale" ? "Stale" : "No"))
+            String v = unknown ? "?" :
+                       (cellState == "live"      ? "Yes" :
+                        cellState == "livestale" ? "Yes+Stale" :
+                        cellState == "stale"     ? "Stale" : "No")
             sb << "<td class='c'>${v}</td>"
         }
         List<String> modesList = normalizeModesList(r.modes)
@@ -1595,7 +1971,10 @@ String buildRmCsv() {
         List vals = [r.id, r.name, r.appType]
         SPECIAL_ACTION_KEYS.each { String key ->
             String cellState = keywordCellState(actions[key], suppressStale)
-            vals << (unknown ? "?" : (cellState == "live" ? "Yes" : (cellState == "stale" ? "Stale" : "No")))
+            vals << (unknown ? "?" :
+                     (cellState == "live"      ? "Yes" :
+                      cellState == "livestale" ? "Yes+Stale" :
+                      cellState == "stale"     ? "Stale" : "No"))
         }
         vals << (unknown ? "?" : normalizeModesList(r.modes).join(", "))
         vals << r.lastRun
@@ -1864,7 +2243,8 @@ String buildReportHtml(List<Map> rows) {
     if (isSuppressStaleEnabled()) {
         sb << "<i>(stale-only matches are currently shown as not found — see Controls)</i> &nbsp; "
     } else {
-        sb << "<span style='color:#d98800;font-weight:bold;'>&#10003;</span> = found only in stale/leftover entries (deleted actions, clipboard, old settings) &nbsp; "
+        sb << "<span style='font-weight:bold;white-space:nowrap;'><span style='color:green;'>&#10003;</span><span style='color:#c00;'>&#10003;</span></span> = active, plus stale leftovers &nbsp; "
+        sb << "<span style='color:#c00;font-weight:bold;'>&#10003;</span> = found only in stale/leftover entries (deleted actions, clipboard, old settings) &nbsp; "
     }
     sb << "<span style='color:#aaa;'>—</span> = not found &nbsp; "
     sb << "<span style='color:#c00;font-weight:bold;'>?</span> = could not be read"
@@ -1895,7 +2275,7 @@ String buildReportHtml(List<Map> rows) {
         Map actions = normalizeKeywordMap(r.specialActions instanceof Map ? (Map) r.specialActions : [:])
         boolean unknown = r.specialUnknown == true
         boolean suppressStale = isSuppressStaleEnabled()
-        boolean anySpecial = !unknown && SPECIAL_ACTION_KEYS.any { String key -> keywordCellState(actions[key], suppressStale) == "live" }
+        boolean anySpecial = !unknown && SPECIAL_ACTION_KEYS.any { String key -> keywordCellState(actions[key], suppressStale) in ["live", "livestale"] }
         boolean anyStale   = !unknown && SPECIAL_ACTION_KEYS.any { String key -> keywordCellState(actions[key], suppressStale) == "stale" }
         String specialAny = unknown ? "unknown" : (anySpecial ? "true" : (anyStale ? "stale" : "false"))
 
@@ -1913,9 +2293,13 @@ String buildReportHtml(List<Map> rows) {
                 sortVal = "2"
             } else if (cellState == "live") {
                 disp    = "<span style='color:green;font-weight:bold;'>&#10003;</span>"
+                sortVal = "4"
+            } else if (cellState == "livestale") {
+                disp    = "<span title='Active special action, but this rule ALSO carries stale/leftover entries for it not referenced by its current actionList (e.g., deleted actions, clipboard copies, old settings)' style='font-weight:bold;white-space:nowrap;'>" +
+                          "<span style='color:green;'>&#10003;</span><span style='color:#c00;'>&#10003;</span></span>"
                 sortVal = "3"
             } else if (cellState == "stale") {
-                disp    = "<span title='Found only in stale/leftover entries not referenced by this rule&#39;s current actionList (e.g., deleted actions, clipboard copies, old settings)' style='color:#d98800;font-weight:bold;'>&#10003;</span>"
+                disp    = "<span title='Found only in stale/leftover entries not referenced by this rule&#39;s current actionList (e.g., deleted actions, clipboard copies, old settings)' style='color:#c00;font-weight:bold;'>&#10003;</span>"
                 sortVal = "1"
             } else {
                 disp    = "<span style='color:#aaa;'>—</span>"
@@ -1962,14 +2346,15 @@ Map emptyKeywordCounts() {
 }
 
 // Normalize a stored keyword map (which round-trips through state JSON) back
-// to tri-state values: true (live), "stale" (found only in leftover entries),
-// or false (not found).
+// to four-state values: true (live only), "livestale" (live plus stale
+// leftovers), "stale" (found only in leftover entries), or false (not found).
 Map normalizeKeywordMap(Map raw) {
     Map m = [:]
     SPECIAL_ACTION_KEYS.each { String key ->
         Object v = raw?.get(key)
         String s = v?.toString()
         if (v == true || s == "true")   { m[key] = true }
+        else if (s == "livestale")      { m[key] = "livestale" }
         else if (s == "stale")          { m[key] = "stale" }
         else                            { m[key] = false }
     }
@@ -1977,11 +2362,14 @@ Map normalizeKeywordMap(Map raw) {
 }
 
 // Resolve a normalized keyword value to its display state, honoring the
-// "Treat stale-only keyword matches as not found" toggle.
-// Returns "live", "stale", or "none".
+// "Treat stale-only keyword matches as not found" toggle (which also hides
+// the stale half of a mixed live+stale match).
+// Returns "live", "livestale", "stale", or "none".
 String keywordCellState(Object v, boolean suppressStale) {
-    if (v == true || v?.toString() == "true") return "live"
-    if (v?.toString() == "stale") return suppressStale ? "none" : "stale"
+    String s = v?.toString()
+    if (v == true || s == "true") return "live"
+    if (s == "livestale") return suppressStale ? "live" : "livestale"
+    if (s == "stale") return suppressStale ? "none" : "stale"
     return "none"
 }
 
@@ -2007,12 +2395,14 @@ void updateSpecialActionStats(List<Map> rows) {
             boolean any = false
             boolean anyStale = false
             SPECIAL_ACTION_KEYS.each { String key ->
-                if (actions[key] == true) {
+                String s = actions[key]?.toString()
+                boolean live      = (actions[key] == true || s == "livestale")
+                boolean hasStale  = (s == "stale" || s == "livestale")
+                if (live) {
                     counts[key] = (counts[key] ?: 0) + 1
                     any = true
-                } else if (actions[key]?.toString() == "stale") {
-                    anyStale = true
                 }
+                if (hasStale) anyStale = true
             }
             if (any) ruleCount++
             if (anyStale) staleRuleCount++
